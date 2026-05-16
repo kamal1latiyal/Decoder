@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Cloned upstream kernel sources (re-fetched by scripts/install.sh)
+.megakernel_upstream/
+
+# JIT build / kernel cache
+build/
+*.ninja_log
+*.ninja_deps
+torch_extensions/
+
+# Models + audio outputs
+*.safetensors
+*.bin
+*.wav
+*.raw
+*.pcm
+
+# Logs / metrics
+*.log
+metrics/
+benchmarks/results/
+
+# Claude / agent state
+.claude/
