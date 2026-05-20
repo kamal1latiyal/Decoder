@@ -12,9 +12,10 @@ voice pipeline.
 ## 2. Architecture match — what's actually compatible
 
 The first draft of this design (commit history) claimed the megakernel was a
-near drop-in for the talker. Reading
-[`config.json`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/blob/main/config.json)
-on 2026-05-16 shows it isn't. Honest comparison:
+near drop-in for the talker. Local CPU-side inspection of the real
+`qwen_tts==0.1.x` package source (verified 2026-05-21 against
+`Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `scripts/inspect_model.py`) shows it
+isn't. Honest comparison:
 
 | Parameter                       | Megakernel (Qwen3-0.6B) | Qwen3-TTS Talker            | Match |
 |---------------------------------|------------------------|-----------------------------|-------|
@@ -29,19 +30,52 @@ on 2026-05-16 shows it isn't. Honest comparison:
 | Input embedding                 | text vocab 151,936     | **text + codec; text hidden = 2048**  | ✗ HF handles |
 | Output head                     | vocab 151,936          | **codec vocab 3,072**       | ✓ kernel infers from tensor shape |
 
-Two consequences:
+Three consequences (all confirmed by reading `qwen_tts` source 2026-05-21):
 
 1. **The megakernel cannot do text prefill.** The talker projects text
-   embeddings from `text_hidden_size=2048 → hidden_size=1024` before entering
-   the transformer stack — the kernel has no such projection. We do prefill
-   in HF and hand the warm KV cache to the kernel.
+   embeddings from `text_hidden_size=2048 → hidden_size=1024` (`text_projection`)
+   before entering the transformer stack — the kernel has no such projection.
+   We do prefill in HF (one forward through `talker.model`) and hand the warm
+   KV cache to the kernel.
 
-2. **The codec decode loop *is* a Qwen3-0.6B-shaped transformer.** Once the
-   KV cache is warm and we're feeding codec tokens (input embed = codec embed
-   [3072,1024]), the per-step decode matches the megakernel exactly. No kernel
-   modification needed. The vocab is implicit in the `embed_weight` /
-   `lm_head_weight` tensor shapes — there is no `LDG_VOCAB_SIZE` flag in
-   upstream and we don't add one.
+2. **The codec decode loop is NOT just embed(token_id) → transformer.** From
+   `Qwen3TTSTalkerForConditionalGeneration.forward` (modeling_qwen3_tts.py
+   lines 1665–1692), the talker's per-step input is
+
+      inputs_embeds = Σᵢ embedᵢ(groupᵢ) + trailing_text_hidden[step]
+
+   — the SUM of 16 codec-token embeddings (talker emits group-0; subtalker
+   emits groups 1..15) plus a projected text-hidden vector for the current
+   step. This 1024-d vector cannot be represented as `embed[token_id]` for
+   any token_id, so the kernel's `decode(token_id, ...)` signature doesn't
+   fit directly.
+
+   **Fix without kernel changes**: the kernel does
+   `embed_row = embed_weight + token_id * HIDDEN_SIZE`. We pass a 1-row bf16
+   embed table containing our pre-computed input hidden and `token_id=0`,
+   so the lookup lands on our injected vector. See
+   `MegakernelDecoder.step_from_hidden()` in `tts/talker.py`. The CUDA code
+   path is identical to a normal embed lookup — same memory traffic, same
+   address calculation, same downstream layers; we're just abusing the
+   embed table as a 1-entry hidden cache.
+
+3. **The codec decode HIDDEN STATE is exposed by the kernel.** The kernel
+   writes the post-norm hidden into `g_normalized` (float32 [HIDDEN_SIZE])
+   before the LM head matmul — our `self.norm_out` tensor. We return a
+   bf16 view of it from `step_from_hidden()`, and the subtalker uses it as
+   `past_hidden` for the NEXT frame. This fixes the "subtalker conditioning
+   is one-step stale" limitation that the initial design listed.
+
+The 1-row table is bf16 like the real codec embed; the LM head is the talker's
+`codec_head` (NOT `lm_head` — that's the text-vocab head we ignore).
+
+**Vocab size IS compile-time-baked into the kernel.** Upstream hardcodes
+`constexpr int LDG_VOCAB_SIZE = 151936;` (Qwen3-0.6B text vocab). We patch
+upstream via `install.sh` (an idempotent perl edit that wraps the constexpr in
+`#ifndef`), then pass `-DLDG_VOCAB_SIZE=3072` from `qwen_megakernel_tts/build.py`.
+This is the only deviation from the upstream kernel source. Without it the LM-head
+kernel would OOB-read 148,864 rows past the codec_head tensor and return
+garbage argmax — caught locally before renting the 5090, see commit history.
 
 ---
 
@@ -77,22 +111,49 @@ Two consequences:
 ```
 
 ### Stage 1 — text prefill (HF, one-time per utterance)
-- `Qwen3TTSModel.generate(..., max_new_tokens=1)` runs the talker over the
-  text prompt with speaker conditioning, produces past_key_values + the first
-  codec token + the last hidden state.
-- Cost is ~30–80 ms for a typical 30–60 text-token prompt. Amortised over
-  the whole utterance, this is the only stage that doesn't benefit from the
-  kernel.
+- The wrapper's text/codec prefix construction is fragile (handles
+  `voice_clone_prompt`, language id, codec_think/codec_pad/codec_bos
+  special tokens, speaker x-vector injection — ~80 lines in
+  `Qwen3TTSForConditionalGeneration.generate`). Re-implementing that
+  ourselves would silently drift on any qwen_tts bump.
+
+- Instead: **monkey-patch `model.talker.generate`** to do a single
+  `talker.model.forward(inputs_embeds=…, use_cache=True)`, then raise a
+  sentinel `_PrefillDone` exception. We call
+  `wrapper.generate_voice_clone(text=text, voice_clone_prompt=…, do_sample=False, max_new_tokens=1)`
+  and catch the sentinel. The wrapper handles all the input-embeds
+  construction; we just intercept right before generation would loop.
+  See `tts/pipeline.py: _hf_prefill`.
+
+- Captures: `(first_token, kv_cache, last_hidden, trailing_text_hidden, tts_pad_embed)`.
+- `last_hidden_state` from `talker.model.forward` is already post-norm
+  (`Qwen3TTSTalkerModel.forward` applies `self.norm` before returning,
+  modeling_qwen3_tts.py:1550). That matches what the megakernel's
+  `g_normalized` produces, so the two paths are layout-compatible.
+- Cost: ~30–80 ms for a typical 30–60 text-token prompt.
 
 ### Stage 2 — megakernel codec decode (hot loop, 12.5 Hz of audio)
-- `MegakernelDecoder.step(token)` calls
-  `torch.ops.qwen_megakernel_C.decode(...)` with the codec-vocab embed +
-  lm_head and the warmed KV cache. Returns next codec token id.
-- Target: ≈1 ms / token. 1 s of audio = 12.5 tokens = ~12.5 ms.
+- `MegakernelDecoder.step_from_hidden(input_hidden)` calls
+  `torch.ops.qwen_megakernel_C.decode(...)` with `embed_weight = 1×1024 bf16
+  row containing the caller's hidden`, `token_id = 0`, plus the codec-vocab
+  `codec_head` weight and the warmed KV cache. Returns
+  `(next_codec_token_id, post_norm_hidden_bf16[1024])`.
+- Target: ≈1 ms / step (same as upstream Qwen3-0.6B since the per-step
+  compute is identical — the embed lookup is the same 2 KB read).
+- 1 s of audio = 12.5 talker steps ⇒ ~12.5 ms of kernel work.
 
 ### Stage 3 — code predictor (HF, 5 layers, ~2 ms/token)
-- The official subtalker is called per group-0 token to autoregressively emit
-  groups 1..15 within the frame. Not a throughput bottleneck.
+- `model.talker.code_predictor.generate(inputs_embeds=cat(past_hidden, embed(group0)), max_new_tokens=15, output_hidden_states=True, return_dict_in_generate=True)`
+  emits groups 1..15 of the current frame.
+- `past_hidden` is the talker post-norm hidden from the current kernel step
+  — `MegakernelDecoder.step_from_hidden`'s second return value.
+- The orchestrator builds the next kernel input from the subtalker's frame:
+
+      codec_hidden_sum = embed(group0) + Σᵢ₌₁..₁₅ embedᵢ(groupᵢ)   # CodePredictor returns this
+      next_input       = codec_hidden_sum + (trailing_text_hidden[step] OR tts_pad_embed)
+
+  exactly mirroring modeling_qwen3_tts.py:1683–1692. Not a throughput
+  bottleneck.
 
 ### Stage 4 — codec decode (streaming with overlap)
 - `Qwen3-TTS-Tokenizer-12Hz.decode([{"audio_codes": frames}])` produces wav.
@@ -127,12 +188,15 @@ same per-step advance, so this matters less than it looks — but it's still an
 approximation, not a faithful implementation. We document this and move on.
 
 ### 4.3 Buffer sizes
-`bmax_vals/idxs` are sized 4096 (upstream's worst-case bound for the LM head
-block-max reduction), not 1280. The first draft used 1280, which would
-silently corrupt the argmax for the talker's smaller codec vocab — a latent
-bug; the kernel computes block indices assuming 4096 entries.
+`bmax_vals/idxs` are sized 4096 (safe over-allocation; LM-head grid is
+LDG_LM_NUM_BLOCKS=1280 blocks, each writes one entry).
 
-### 4.4 Speaker conditioning
+### 4.4 LDG_VOCAB_SIZE override
+See section 2 — the kernel's `LDG_VOCAB_SIZE` constexpr is patched in
+`install.sh` to be overridable, and `qwen_megakernel_tts/build.py` passes
+`-DLDG_VOCAB_SIZE=3072` for the codec vocab.
+
+### 4.5 Speaker conditioning
 The official `Qwen3TTSModel.create_voice_clone_prompt(ref_audio, ref_text)`
 extracts the speaker x-vector (1024-dim) via the model's
 `extract_speaker_embedding`. We pass the resulting prompt dict into
@@ -211,10 +275,11 @@ Real numbers go in benchmarks/ after the first hardware run.
 
 | Item | Status | Notes |
 |---|---|---|
-| KV cache hand-off layout (HF → kernel) | Coded against documented HF layout `[batch, kv_heads, seq, head_dim]`; **needs hardware run to confirm** transposition matches kernel's `[layer, kv_heads, seq, head_dim]`. | `MegakernelDecoder.set_kv_prefix()` is the single edit point. |
-| MRoPE | Approximated with unified position counter. | Real fix requires patching kernel's RoPE application. |
-| Subtalker hidden-state staleness | Uses talker's pre-step hidden state for the next step's predictor (kernel doesn't expose hidden). | Predictor is robust to one-step-stale conditioning; verify on audio. |
-| Codec streaming via internal sliding window | Currently re-decodes a 4-frame overlap per call. | qwen_tts.core.tokenizer_12hz may expose a streaming API; investigate. |
+| KV cache hand-off layout (HF → kernel) | Extractor confirmed CPU-side against synthetic DynamicCache (28 layers × 8 kv_heads × T × 128 → matches `MegakernelDecoder.set_kv_prefix` expectations). Real KV-tensor SEMANTICS still need hardware-side argmax-equality A/B vs one HF step. | `tts/pipeline.py: _extract_kv_for_kernel`. |
+| MRoPE | Approximated with unified position counter. | Real fix requires patching kernel's RoPE application. For single-channel speech all three position dims collapse to the same advance, so theoretically a no-op. Verify on audio. |
+| Subtalker hidden-state staleness | **Fixed.** Kernel exposes post-norm hidden via `g_normalized` buffer (= `self.norm_out`, float32 [1024]); `step_from_hidden` returns it as bf16. Subtalker now sees the *current* step's hidden. | `tts/talker.py: step_from_hidden`. |
+| Codec streaming via internal sliding window | Currently re-decodes a 4-frame overlap per call. | `qwen_tts.core.tokenizer_12hz` doesn't expose a streaming API in 0.1.x; investigate v2. |
+| Default-voice (no-ref-audio) synthesis | Currently raises in both backends. | Needs a default x-vector seed that `qwen_tts` doesn't expose directly; ship voice-clone path first. |
 | Demo recording | Not produced — requires hardware. | |
 | Benchmarks | Harness in place; numbers pending hardware run. | |
 

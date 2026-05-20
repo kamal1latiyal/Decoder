@@ -30,21 +30,54 @@ text  ─▶ HF prefill ─▶ [megakernel decode ↻] ─▶ subtalker ─▶ c
 
 ---
 
-## Quick start
+## Quick start — one command on a fresh RTX 5090
 
 ```bash
-# 1.  Install (clones the kernel repo, builds extension, installs deps)
+# Optional: bring your own reference voice. If you don't, bootstrap downloads
+# a 416 KB public-domain LJSpeech sample for you.
+# export REF_AUDIO=/path/to/voice.wav
+# export REF_TEXT="exact transcript of voice.wav"
+
+bash scripts/bootstrap.sh
+```
+
+That single command performs steps [0]→[8]:
+
+| Step | Action | ~time |
+|---|---|---|
+| 0 | Sanity check (`nvidia-smi`, `nvcc`, RTX 5090 detection) | 1 s |
+| 1 | `install.sh` — clone kernel, install Python deps, JIT compile (`sm_120a`) | ~3 min |
+| 2 | `download_models.py` — Qwen3-TTS weights from HF (~3 GB) | ~2 min |
+| 3 | Fetch default reference voice (skipped if `REF_AUDIO` is set) | <5 s |
+| 4 | `inspect_model.py --device cuda` — 11 static API checks, fail-fast | ~1 min |
+| 5 | `smoke_test.py` — 9-stage verification (CUDA → kernel → KV parity → E2E) | ~5 min |
+| 6 | Start FastAPI WebSocket server in background, wait for `/health` | ~30 s |
+| 7 | Run TTFC / RTF / E2E benchmarks → `benchmarks/results/` | ~3 min |
+| 8 | Print summary; server stays up for the Pipecat demo | — |
+
+If any step fails the bootstrap exits non-zero with the failing stage label,
+so you can re-run that step manually.
+
+### Manual / step-by-step (if you want to bisect)
+
+```bash
 bash scripts/install.sh
-
-# 2.  Download Qwen3-TTS models (~3 GB)
 python scripts/download_models.py
+curl -fsSL https://github.com/coqui-ai/TTS/raw/dev/tests/data/ljspeech/wavs/LJ001-0001.wav -o refs/voice.wav
+export REF_AUDIO=$PWD/refs/voice.wav
+export REF_TEXT="Printing, in the only sense with which we are at present concerned, differs from most if not from all the arts and crafts represented in the Exhibition"
 
-# 3.  Start the TTS WebSocket server
+python scripts/inspect_model.py --device cuda    # cheap static check
+python scripts/smoke_test.py                      # 9-stage fail-fast (incl. kernel↔HF parity)
+
 python -m server.app --host 0.0.0.0 --port 8765 \
     --backend megakernel \
-    [--ref-audio /path/to/voice.wav --ref-text "transcript of voice.wav"]
+    --ref-audio "$REF_AUDIO" --ref-text "$REF_TEXT"
+```
 
-# 4.  (Optional) Run the Pipecat voice loop
+### Running the Pipecat voice loop (after the server is up)
+
+```bash
 export DEEPGRAM_API_KEY=...
 export ANTHROPIC_API_KEY=...
 python pipecat_integration/demo.py

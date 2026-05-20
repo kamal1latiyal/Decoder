@@ -119,17 +119,36 @@ async def run_pipeline(ws_host: str = "0.0.0.0", ws_port: int = 8766):
     await runner.run(task)
 
 
+def _load_dotenv_if_present():
+    """Read KEY=VALUE lines from ./.env into os.environ (does not overwrite existing).
+    No dependency on python-dotenv; demo should run on any fresh env."""
+    from pathlib import Path
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and v and k not in os.environ:
+            os.environ[k] = v
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pipecat Megakernel TTS Demo")
     parser.add_argument("--ws-host", default="0.0.0.0", help="WebSocket listen host")
     parser.add_argument("--ws-port", type=int, default=8766, help="WebSocket listen port")
     args = parser.parse_args()
 
-    if "DEEPGRAM_API_KEY" not in os.environ:
-        print("ERROR: Set DEEPGRAM_API_KEY environment variable", file=sys.stderr)
-        sys.exit(1)
-    if "ANTHROPIC_API_KEY" not in os.environ:
-        print("ERROR: Set ANTHROPIC_API_KEY environment variable", file=sys.stderr)
+    _load_dotenv_if_present()
+
+    missing = [k for k in ("DEEPGRAM_API_KEY", "ANTHROPIC_API_KEY") if k not in os.environ]
+    if missing:
+        print(f"ERROR: missing env vars: {', '.join(missing)}", file=sys.stderr)
+        print("  Set them in your shell, or copy .env.example → .env and fill in.",
+              file=sys.stderr)
         sys.exit(1)
 
     asyncio.run(run_pipeline(ws_host=args.ws_host, ws_port=args.ws_port))

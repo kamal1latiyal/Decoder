@@ -14,7 +14,10 @@ qwen-tts>=0.1.1
 # Audio
 librosa>=0.10
 soundfile>=0.12
-torchaudio>=2.7
+# torchaudio is installed alongside torch from the CUDA 12.8 wheel index by
+# install.sh — DO NOT pin / re-add it here, pip will replace the CUDA wheel
+# with a PyPI build that has an ABI mismatch (see OSError: Symbol not found:
+# _torch_library_impl on macOS local testing).
 einops
 
 # JIT kernel compilation

@@ -1,79 +1,146 @@
 """
-CodePredictor — thin wrapper around the official Qwen3-TTS code predictor
-(the "subtalker") sub-model.
+CodePredictor — wraps the Qwen3-TTS talker's code predictor ("subtalker") for
+per-frame autoregressive expansion of group-0 → groups 1..15.
 
-Per Qwen/Qwen3-TTS-12Hz-0.6B-Base config.json the code predictor is a 5-layer
-qwen3_tts_talker_code_predictor with num_code_groups=16. For each group-0
-codec token produced by the talker, it autoregressively predicts groups 1..15
-to form a complete 16-codebook RVQ frame.
+From qwen_tts/core/models/modeling_qwen3_tts.py (verified against package
+version 0.1.x), the subtalker lives at:
+    model.talker.code_predictor   →  Qwen3TTSTalkerCodePredictorModelForConditionalGeneration
 
-We do NOT reimplement this — at 5 layers it runs in ~2ms in HF, and
-reproducing the exact training-time conditioning would be error-prone.
-We just call into the loaded model's `subtalker.generate_one_frame` (the
-name used by qwen-tts's modeling code; we feature-detect alternatives).
+Its per-step generate signature (matching how the talker itself drives it
+inside Qwen3TTSTalkerForConditionalGeneration.forward, lines 1671–1680):
+
+    predictor_result = code_predictor.generate(
+        inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),   # [B, 2, 1024]
+        max_new_tokens=15,                  # groups 1..15 (group 0 = talker output)
+        do_sample=subtalker_dosample,
+        top_p=subtalker_top_p,
+        top_k=subtalker_top_k,
+        temperature=subtalker_temperature,
+        output_hidden_states=True,
+        return_dict_in_generate=True,
+    )
+    predictor_result.sequences           # [B, 15] codec ids for groups 1..15
+
+Where:
+  past_hidden     : talker's last-step POST-norm hidden state (shape [B, 1, 1024])
+                    — for us, comes from MegakernelDecoder.step_from_hidden's
+                    second return value, broadcast to [1, 1, 1024].
+  last_id_hidden  : talker's codec_embedding(group0_token).unsqueeze(0)
+                    shape [1, 1, 1024]
+
+CodePredictor.predict() also returns the **summed codec embedding** so the
+pipeline can feed it (plus trailing_text_hidden) back into the megakernel
+as next-step input — replicating exactly what the talker does internally
+at lines 1683–1687 of the modeling file.
 """
 
+from typing import Tuple
+
 import torch
-from typing import Callable
 
 
-NUM_CODE_GROUPS = 16
+NUM_CODE_GROUPS = 16   # 1 talker group-0 + 15 subtalker groups (RVQ)
 
 
 class CodePredictor:
+    """Wraps the subtalker for one-step-at-a-time generation."""
+
     def __init__(self, qwen3_tts_model: torch.nn.Module):
         """
         Args:
-            qwen3_tts_model: a loaded Qwen3TTSForConditionalGeneration instance
-                (the full model — we just borrow its subtalker).
+            qwen3_tts_model: a loaded Qwen3TTSForConditionalGeneration instance.
+                We borrow:
+                  - .talker.code_predictor          (the subtalker module)
+                  - .talker.model.codec_embedding   (group-0 codec embed)
+                  - .talker.code_predictor.model.codec_embedding
+                                                    (group 1..15 codec embeds,
+                                                     as a nn.ModuleList of 15)
         """
-        self.device = next(qwen3_tts_model.parameters()).device
-        self._fn = self._find_predict_fn(qwen3_tts_model)
-
-    def _find_predict_fn(self, model: torch.nn.Module) -> Callable:
-        """Locate the per-frame predictor function on the loaded model.
-
-        We probe a few attribute names because qwen-tts has renamed the
-        sub-module across releases (`subtalker`, `code_predictor`,
-        `talker_code_predictor`).  All variants share an identical 5-layer
-        backbone and a method that takes a group-0 token + the talker's last
-        hidden state and returns the 16 RVQ tokens for the current frame.
-        """
-        for attr in ("subtalker", "code_predictor", "talker_code_predictor"):
-            sub = getattr(model, attr, None)
-            if sub is None:
-                continue
-            for method in ("generate_one_frame", "predict_frame", "forward_one_step"):
-                fn = getattr(sub, method, None)
-                if callable(fn):
-                    return fn
-        raise AttributeError(
-            "Could not locate the code predictor on the loaded Qwen3-TTS model. "
-            "Tried submodules: subtalker / code_predictor / talker_code_predictor."
+        talker = qwen3_tts_model.talker
+        self._subtalker = talker.code_predictor
+        # Group-0 embedding (talker side, shared codec vocab table).
+        self._group0_embed: torch.nn.Embedding = talker.model.codec_embedding
+        # Groups 1..15 embeddings (subtalker side, one nn.Embedding per group).
+        self._group_embeds: torch.nn.ModuleList = (
+            talker.code_predictor.model.codec_embedding
         )
+        if len(self._group_embeds) != NUM_CODE_GROUPS - 1:
+            raise ValueError(
+                f"Expected {NUM_CODE_GROUPS - 1} sub-group embeddings, got "
+                f"{len(self._group_embeds)}"
+            )
+        self.device = next(talker.parameters()).device
+        self.dtype = next(talker.parameters()).dtype
 
     @torch.inference_mode()
-    def predict(self, group0_token: int, talker_hidden: torch.Tensor) -> list[int]:
+    def predict(
+        self,
+        group0_token: int,
+        past_hidden: torch.Tensor,
+        *,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ) -> Tuple[list[int], torch.Tensor]:
         """
-        Returns one 16-element list [group0, group1, ..., group15] of codec
-        token ids.
+        For one frame, expand the talker's group-0 token into a full 16-group
+        codec frame and return the embedding-sum the talker uses as its
+        next-step input.
 
         Args:
-            group0_token: the codec token id emitted by the talker for this frame.
-            talker_hidden: [1, hidden_size] — the talker's last-step hidden state,
-                conditioning for the subtalker.  Provided by the pipeline.
+            group0_token: codec id from the talker (group 0).
+            past_hidden:  the talker's post-norm hidden state from the same
+                          step that produced `group0_token`. Shape [1, 1, 1024]
+                          or [1024] (we reshape).
+            do_sample/top_k/top_p/temperature:
+                          subtalker sampling controls; defaults match qwen_tts's
+                          generate_voice_clone defaults.
+
+        Returns:
+            (frame, codec_hidden_sum)
+              frame:            list[int] of length 16 = [g0, g1, ..., g15]
+              codec_hidden_sum: bf16 tensor [1, 1, 1024]
+                                = embed(g0) + Σᵢ₌₁..₁₅ embedᵢ(gᵢ)
+                                  (the "codec_hiddens.sum(1)" the talker uses
+                                   to construct its NEXT-step input embedding)
         """
-        out = self._fn(
-            group0_token=int(group0_token),
-            hidden=talker_hidden.to(self.device),
+        past_hidden = past_hidden.to(self.device, self.dtype)
+        if past_hidden.dim() == 1:
+            past_hidden = past_hidden.view(1, 1, -1)
+        elif past_hidden.dim() == 2:
+            past_hidden = past_hidden.unsqueeze(1) if past_hidden.shape[0] == 1 else past_hidden.unsqueeze(0)
+
+        # group-0 embedding (from the talker's codec embed table).
+        g0_id = torch.tensor([[group0_token]], dtype=torch.long, device=self.device)
+        last_id_hidden = self._group0_embed(g0_id)                  # [1, 1, 1024]
+
+        # Run the subtalker for 15 steps to emit groups 1..15.
+        result = self._subtalker.generate(
+            inputs_embeds=torch.cat([past_hidden, last_id_hidden], dim=1),  # [1, 2, 1024]
+            max_new_tokens=NUM_CODE_GROUPS - 1,
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
         )
-        # Different versions return either a list, a 1-D tensor, or a tuple.
-        if torch.is_tensor(out):
-            ids = out.flatten().tolist()
-        elif isinstance(out, (list, tuple)):
-            ids = list(out)
-        else:
-            raise TypeError(f"Unexpected predictor output type: {type(out)}")
-        if len(ids) != NUM_CODE_GROUPS:
-            raise ValueError(f"Expected {NUM_CODE_GROUPS} groups, got {len(ids)}: {ids[:4]}...")
-        return [int(x) for x in ids]
+        seq = result.sequences                                       # [1, 15]
+        if seq.shape[-1] != NUM_CODE_GROUPS - 1:
+            raise RuntimeError(
+                f"Subtalker emitted {seq.shape[-1]} tokens, expected "
+                f"{NUM_CODE_GROUPS - 1}"
+            )
+
+        # Build the codec_hidden sum the talker uses for the NEXT step's input
+        # (modeling_qwen3_tts.py lines 1683–1687 — verbatim layout):
+        #   codec_hiddens = [embed(g0), sub_embed[0](g1), ..., sub_embed[14](g15)]
+        #   inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+        parts = [last_id_hidden]
+        for i in range(NUM_CODE_GROUPS - 1):
+            parts.append(self._group_embeds[i](seq[..., i : i + 1]))   # [1, 1, 1024]
+        codec_hidden_sum = torch.cat(parts, dim=1).sum(dim=1, keepdim=True)  # [1, 1, 1024]
+
+        frame = [int(group0_token)] + [int(x) for x in seq.flatten().tolist()]
+        return frame, codec_hidden_sum

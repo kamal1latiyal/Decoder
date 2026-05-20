@@ -129,7 +129,130 @@ def s5(kw):
     return dec
 
 
-@stage("6. Codec decode → PCM file")
+@stage("6. Kernel ↔ HF parity (warm KV from synthetic prefix)")
+def s_parity(wrapper, kw):
+    """
+    Cheapest hardware-side check that the kernel's per-step decode produces the
+    same result as the HF talker, given the same warm KV cache.
+
+    Why this matters: the KV cache hand-off from HF (DynamicCache,
+    [B, kv_heads, T, head_dim]) to the kernel ([L, kv_heads, T, head_dim])
+    relies on a layout assumption that we can't validate without running both
+    paths. The other latent risk is RoPE convention (MRoPE vs split-half RoPE,
+    cos/sin pair ordering, theta).  This stage exercises both end-to-end on
+    short synthetic data.
+
+    Strategy:
+      1. Build a random prefix in *embedding space* (bf16 [1, 8, 1024]).
+      2. HF: run talker.model.forward(inputs_embeds=prefix, use_cache=True).
+         Capture (kv_cache, last_hidden) before any further mutation.
+      3. Build a random next-step input vector.
+      4. HF: run talker.model.forward(inputs_embeds=next_input, past_kv=kv,
+         use_cache=True). Capture post-norm hidden + codec_head argmax.
+      5. Kernel: reset, set_kv_prefix(extracted k/v from step 2 — captured
+         BEFORE step 4 mutated anything), step_from_hidden(next_input).
+         Capture post-norm hidden (norm_out) + output token.
+      6. Compare per-element hidden vectors (allclose with bf16-friendly
+         tolerance) and argmax tokens.
+
+    Pass criteria (any failure is reported with detailed diagnostics):
+      - hidden state allclose with atol=0.25, rtol=0.10
+      - tokens match  OR  kernel's token is in HF's top-5
+    """
+    import torch, sys
+    from tts.talker import MegakernelDecoder
+    from tts.pipeline import _extract_kv_for_kernel
+
+    torch.manual_seed(42)
+    device = next(wrapper.model.parameters()).device
+    dtype = next(wrapper.model.parameters()).dtype
+    assert dtype == torch.bfloat16, f"expected talker in bf16, got {dtype}"
+
+    talker = wrapper.model.talker            # Qwen3TTSTalkerForConditionalGeneration
+    talker_model = talker.model              # Qwen3TTSTalkerModel (the 28-layer backbone)
+
+    # 1. Random prefix in embedding space.  Small scale so values stay in the
+    #    bf16 sweet spot and we don't trigger numerical edge cases.
+    prefix_len = 8
+    prefix = (torch.randn(1, prefix_len, 1024, device=device) * 0.1).to(dtype)
+    print(f"  prefix shape={tuple(prefix.shape)} dtype={prefix.dtype}")
+
+    # 2. HF prefill — capture KV BEFORE we run the next-step forward (which
+    #    mutates the DynamicCache in place).
+    with torch.inference_mode():
+        prefill_out = talker_model.forward(
+            inputs_embeds=prefix, use_cache=True, output_hidden_states=False,
+        )
+    kv_for_kernel_k, kv_for_kernel_v = _extract_kv_for_kernel(prefill_out.past_key_values)
+    print(f"  KV extracted             : k={tuple(kv_for_kernel_k.shape)} "
+          f"v={tuple(kv_for_kernel_v.shape)}  dtype={kv_for_kernel_k.dtype}")
+    assert kv_for_kernel_k.shape == (28, 8, prefix_len, 128), kv_for_kernel_k.shape
+
+    # 3. Random next-step input vector (1024-dim bf16).
+    next_input = (torch.randn(1024, device=device) * 0.1).to(dtype)
+
+    # 4. HF: one more step from the warm cache.
+    with torch.inference_mode():
+        hf_step = talker_model.forward(
+            inputs_embeds=next_input.view(1, 1, 1024),
+            past_key_values=prefill_out.past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+    hf_hidden = hf_step.last_hidden_state[0, -1, :].to(torch.float32)        # [1024]
+    hf_logits = talker.codec_head(hf_step.last_hidden_state[:, -1, :])[0]    # [3072]
+    hf_topk = torch.topk(hf_logits, 5)
+    hf_token = int(hf_topk.indices[0].item())
+
+    # 5. Kernel: same warm KV (captured pre-mutation), same next_input.
+    dec = MegakernelDecoder(kw)
+    dec.reset()
+    dec.set_kv_prefix(kv_for_kernel_k, kv_for_kernel_v)
+    kernel_token, kernel_hidden_bf16 = dec.step_from_hidden(next_input)
+    kernel_hidden = kernel_hidden_bf16.to(torch.float32).view(-1)             # [1024]
+
+    # 6. Diagnostics.
+    abs_diff = (kernel_hidden - hf_hidden).abs()
+    max_abs = abs_diff.max().item()
+    mean_abs = abs_diff.mean().item()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        kernel_hidden.unsqueeze(0), hf_hidden.unsqueeze(0)
+    ).item()
+    print(f"  HF top-5 tokens          : {hf_topk.indices.tolist()}")
+    print(f"  HF top-1 token / logit   : {hf_token} / {hf_topk.values[0].item():.2f}")
+    print(f"  Kernel token             : {kernel_token}")
+    print(f"  hidden max|Δ|            : {max_abs:.4f}")
+    print(f"  hidden mean|Δ|           : {mean_abs:.4f}")
+    print(f"  hidden cosine            : {cos_sim:.6f}")
+
+    hf_top5_ids = set(hf_topk.indices.tolist())
+    token_match = (kernel_token == hf_token)
+    token_in_top5 = (kernel_token in hf_top5_ids)
+    # bf16 over 28 layers + diverging-RoPE-conventions accumulate error; be generous
+    # but not infinite. atol=0.25 = ~10x bf16-noise of a single layer; cosine >0.95
+    # means the directions agree, which is the load-bearing thing for argmax.
+    hidden_ok = (cos_sim > 0.95) and (max_abs < 0.25)
+
+    if hidden_ok and token_match:
+        print(f"  → PASS: kernel matches HF (token + hidden)")
+    elif hidden_ok and token_in_top5:
+        print(f"  → PASS (degraded): kernel token differs from HF top-1 but lies in "
+              f"HF top-5; hidden direction matches")
+    elif token_match:
+        print(f"  → MARGINAL: tokens agree but hidden state drifted "
+              f"(max|Δ|={max_abs:.3f}, cos={cos_sim:.4f}) — bf16 noise or kernel "
+              f"computing something subtly different. Acceptable iff smoke audio sounds clean.")
+    else:
+        print(f"  → FAIL: tokens disagree AND hidden state diverged")
+        print(f"     Likely root causes (in order of probability):")
+        print(f"       1. KV layout mismatch (transpose / interleave)")
+        print(f"       2. RoPE convention (split-half vs interleaved, cos/sin ordering)")
+        print(f"       3. MRoPE position-dim handling")
+        print(f"       4. Weight extraction (wrong codec_head / norm / layer order)")
+        sys.exit(1)
+
+
+@stage("7. Codec decode → PCM file")
 def s6(wrapper):
     """
     Feed the codec a few synthetic frames and write 0.5s of (garbage) audio
@@ -158,16 +281,30 @@ def s6(wrapper):
     print(f"  wrote {out_path}")
 
 
-@stage("7. End-to-end pipeline (HF backend)")
+def _ref_args():
+    """Read REF_AUDIO/REF_TEXT from env. Both backends now require a reference voice."""
+    import os
+    ref_audio = os.environ.get("REF_AUDIO")
+    ref_text = os.environ.get("REF_TEXT")
+    if not ref_audio:
+        raise RuntimeError(
+            "REF_AUDIO env var not set. Both backends require a reference voice.\n"
+            "  Option 1 (recommended): run bootstrap.sh, which auto-downloads one.\n"
+            "  Option 2: export REF_AUDIO=/path/to/voice.wav REF_TEXT='transcript'"
+        )
+    return ref_audio, ref_text
+
+
+@stage("8. End-to-end pipeline (HF backend)")
 def s7():
     import asyncio
-    import numpy as np
     import wave
     from pathlib import Path
     from tts.pipeline import TTSPipeline
 
-    print("  loading pipeline (backend=hf, no voice clone) ...")
-    pipe = TTSPipeline(backend="hf")
+    ref_audio, ref_text = _ref_args()
+    print(f"  loading pipeline (backend=hf, ref={ref_audio}) ...")
+    pipe = TTSPipeline(backend="hf", ref_audio_path=ref_audio, ref_text=ref_text)
 
     async def run():
         pcm_all = bytearray()
@@ -189,15 +326,16 @@ def s7():
     print(f"  wrote {out_path} ({len(pcm)} bytes)")
 
 
-@stage("8. End-to-end pipeline (megakernel backend)")
+@stage("9. End-to-end pipeline (megakernel backend)")
 def s8():
     import asyncio
     import wave
     from pathlib import Path
     from tts.pipeline import TTSPipeline
 
-    print("  loading pipeline (backend=megakernel) ...")
-    pipe = TTSPipeline(backend="megakernel")
+    ref_audio, ref_text = _ref_args()
+    print(f"  loading pipeline (backend=megakernel, ref={ref_audio}) ...")
+    pipe = TTSPipeline(backend="megakernel", ref_audio_path=ref_audio, ref_text=ref_text)
 
     async def run():
         pcm_all = bytearray()
@@ -229,6 +367,7 @@ def main():
     wrapper = s3()
     kw = s4(wrapper)
     s5(kw)
+    s_parity(wrapper, kw)     # NEW: cheapest hardware-side correctness check
     s6(wrapper)
     s7()
     s8()

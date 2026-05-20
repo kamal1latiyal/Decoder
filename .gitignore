@@ -32,5 +32,10 @@ torch_extensions/
 metrics/
 benchmarks/results/
 
+# Secrets / env
+.env
+.env.local
+.envrc
+
 # Claude / agent state
 .claude/

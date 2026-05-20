@@ -18,11 +18,27 @@ The Qwen3-TTS talker is NOT a drop-in for Qwen3-0.6B. From config.json:
     text_vocab_size        : 151_936  ← text input vocab
     vocab_size             :   3_072  ← codec output vocab
 
-The transformer backbone (after the embed projection) matches Qwen3-0.6B in
-every architectural dimension. The megakernel can therefore drive the talker's
-*per-step decode* of codec tokens — but it CANNOT do the text prefill, because
-text tokens flow through a separate 2048-dim text embedding + 2048→1024
-projection that the kernel doesn't implement.
+WEIGHT NAMING (verified against qwen_tts 0.1.x source, see core/models/modeling_qwen3_tts.py):
+The talker module is `Qwen3TTSTalkerForConditionalGeneration` at attribute
+`top_model.talker`. Its state_dict, when extracted from the talker module
+directly (not the parent), looks like:
+
+  model.codec_embedding.weight          [3072, 1024]   ← codec input embed
+  model.text_embedding.weight           [151936, 2048] ← NOT used by kernel
+  model.norm.weight                     [1024]         ← final RMSNorm
+  model.layers.{i}.input_layernorm.weight                    [1024]
+  model.layers.{i}.self_attn.{q,k,v,o}_proj.weight           [1024,1024 or 1024,2048]
+  model.layers.{i}.self_attn.{q,k}_norm.weight               [128]
+  model.layers.{i}.post_attention_layernorm.weight           [1024]
+  model.layers.{i}.mlp.{gate,up,down}_proj.weight            [3072,1024 or 1024,3072]
+  codec_head.weight                     [3072, 1024]   ← codec output head
+  lm_head.weight                        [151936, 1024] ← TEXT head, NOT used by kernel
+  text_projection.linear_fc{1,2}.weight                ← NOT used by kernel (prefill only)
+  code_predictor.*                                      ← subtalker, NOT used by kernel
+
+The kernel only sees codec-side weights (embed + 28 decoder layers + final norm +
+codec_head). Everything else (text embed, text projection, code predictor) is
+kept HF-side for prefill and per-step subtalker work.
 
 INTEGRATION STRATEGY:
   * Text prefill (one-time, ~50 text tokens):  run via HuggingFace forward,
@@ -30,9 +46,8 @@ INTEGRATION STRATEGY:
   * Codec autoregressive decode (the hot loop, 12.5 tokens / sec of audio):
     drive each step with `torch.ops.qwen_megakernel_C.decode(...)`.
 
-This loader extracts the codec-side weights (codec embed + lm head + per-layer
-transformer weights) into the pointer-packed layout the megakernel struct
-expects.  See LDGLayerWeights in csrc/torch_bindings.cpp.
+This loader extracts the codec-side weights into the pointer-packed layout the
+megakernel struct expects.  See LDGLayerWeights in csrc/torch_bindings.cpp.
 """
 
 import struct
@@ -70,13 +85,13 @@ class TalkerKernelWeights:
     def __init__(self, talker_module: torch.nn.Module):
         """
         Args:
-            talker_module: the talker sub-model from a loaded
-                Qwen3TTSForConditionalGeneration instance.  Must already be
-                on CUDA in bfloat16. Expected attributes:
-                  - codec_embed_tokens (or model.embed_tokens) [3072, 1024]
-                  - model.layers[i].{q_proj, k_proj, ...}
-                  - model.norm.weight
-                  - lm_head.weight
+            talker_module: the `Qwen3TTSTalkerForConditionalGeneration` instance,
+                accessible as `Qwen3TTSForConditionalGeneration.talker`.
+                Must already be on CUDA in bfloat16. Expected layout:
+                  - model.codec_embedding.weight   [3072, 1024]
+                  - model.norm.weight              [1024]
+                  - model.layers.{i}.{q_proj,...}
+                  - codec_head.weight              [3072, 1024]
         """
         self.device = torch.device("cuda")
         self._packed_buf: bytes | None = None
@@ -87,46 +102,67 @@ class TalkerKernelWeights:
         sd = dict(talker.state_dict())
 
         # ---- codec input embedding -------------------------------------------
+        # The talker module's codec embed lives at `model.codec_embedding.weight`.
+        # We also accept a few legacy/alt names in case qwen_tts renames it.
         embed_candidates = [
-            "codec_embed_tokens.weight",
-            "model.codec_embed_tokens.weight",
-            "model.embed_tokens.weight",
-            "embed_tokens.weight",
+            "model.codec_embedding.weight",
+            "codec_embedding.weight",
+            "model.codec_embed_tokens.weight",  # speculative legacy name
         ]
         embed_key = next((k for k in embed_candidates if k in sd), None)
         if embed_key is None:
             raise KeyError(
-                f"Cannot find codec embed weight. Tried {embed_candidates}. "
-                f"Available top-level keys: {list(sd)[:20]}"
+                f"Cannot find codec embed weight on the talker module. "
+                f"Tried {embed_candidates}. "
+                f"Available top-level keys (first 20): {list(sd)[:20]}"
             )
         embed = sd[embed_key]
         if embed.shape[0] != 3072:
             raise ValueError(
                 f"Expected codec embed of shape [3072, 1024]; got {tuple(embed.shape)}. "
-                "Check that you passed the talker module, not the full text-side embed."
+                "Pass `Qwen3TTSForConditionalGeneration.talker` — not the parent model, "
+                "and not the talker's `.model` submodule."
             )
         self.embed_weight = embed.to(torch.bfloat16).to(self.device).contiguous()
 
-        # ---- final norm + lm head --------------------------------------------
+        # ---- final norm -------------------------------------------------------
         norm_key = next(
             (k for k in ("model.norm.weight", "norm.weight") if k in sd),
             None,
         )
         if norm_key is None:
-            raise KeyError("Cannot find talker final-norm weight.")
+            raise KeyError(
+                f"Cannot find talker final-norm weight. "
+                f"Available keys containing 'norm': "
+                f"{[k for k in sd if 'norm' in k.lower()][:10]}"
+            )
         self.final_norm_weight = sd[norm_key].to(torch.bfloat16).to(self.device).contiguous()
 
-        if "lm_head.weight" in sd:
-            self.lm_head_weight = sd["lm_head.weight"].to(torch.bfloat16).to(self.device).contiguous()
-        else:
-            # Tied embedding (codec embed reused as lm head).
-            self.lm_head_weight = self.embed_weight
+        # ---- codec output head (NOT lm_head — that's the text head) ----------
+        # The talker has two output heads:
+        #   - codec_head : Linear(1024, 3072)    ← what we want
+        #   - lm_head    : Linear(1024, 151936)  ← text head, untrained/ignored at decode time
+        codec_head_candidates = ["codec_head.weight", "model.codec_head.weight"]
+        codec_head_key = next((k for k in codec_head_candidates if k in sd), None)
+        if codec_head_key is None:
+            raise KeyError(
+                f"Cannot find talker codec_head weight. "
+                f"Tried {codec_head_candidates}. "
+                "Note: 'lm_head' is the TEXT head (vocab 151936), not what the megakernel needs."
+            )
+        codec_head = sd[codec_head_key]
+        if codec_head.shape[0] != 3072 or codec_head.shape[1] != 1024:
+            raise ValueError(
+                f"codec_head shape {tuple(codec_head.shape)} != expected [3072, 1024]"
+            )
+        self.lm_head_weight = codec_head.to(torch.bfloat16).to(self.device).contiguous()
 
         # ---- per-layer weights, packed into LDGLayerWeights[NUM_LAYERS] -----
         layers_prefix = self._detect_layers_prefix(sd)
         self.layer_weights_packed = self._pack_layer_weights(sd, layers_prefix)
 
     def _detect_layers_prefix(self, sd: dict) -> str:
+        # The talker module's transformer layers are at `model.layers.{i}`.
         for prefix in ("model.layers.", "layers."):
             if f"{prefix}0.{_LAYER_WEIGHT_KEYS[0]}" in sd:
                 return prefix

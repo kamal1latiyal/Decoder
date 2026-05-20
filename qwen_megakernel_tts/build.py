@@ -1,14 +1,20 @@
 """
 Builds the qwen_megakernel CUDA extension.
 
-The kernel itself is used UNMODIFIED from AlpinDale/qwen_megakernel. There is
-no -DLDG_VOCAB_SIZE flag in upstream — the kernel infers vocab size from the
-embed_weight / lm_head_weight tensor shapes at runtime. So the same compiled
-extension drives Qwen3-0.6B (vocab 151,936) and the Qwen3-TTS talker codec
-head (vocab 3,072) without re-compilation.
+DEVIATION FROM UPSTREAM
+-----------------------
+Upstream kernel.cu hardcodes `constexpr int LDG_VOCAB_SIZE = 151936;` for
+Qwen3-0.6B's text vocab. The Qwen3-TTS talker's codec vocab is 3072, which
+means the LM-head kernel would do an OOB read of 148,864 rows past the
+codec_head tensor → garbage argmax.
 
-Flags below MUST match upstream/qwen_megakernel/build.py exactly — see
-https://github.com/AlpinDale/qwen_megakernel/blob/master/qwen_megakernel/build.py
+We patch upstream via install.sh (idempotent perl edit) to wrap the constexpr
+in `#ifndef LDG_VOCAB_SIZE`, then pass `-DLDG_VOCAB_SIZE=3072` here. The
+default (no -D, e.g. for re-using this build flow with Qwen3-0.6B) remains
+151,936.
+
+Other than that one constant, every kernel flag matches upstream verbatim —
+see https://github.com/AlpinDale/qwen_megakernel/blob/master/qwen_megakernel/build.py
 """
 
 import os
@@ -26,6 +32,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 KERNEL_FLAGS = [
+    # Qwen3-TTS talker codec vocab = 3072.  Upstream kernel hardcodes
+    # LDG_VOCAB_SIZE=151936 (Qwen3-0.6B text vocab); install.sh patches the
+    # constexpr into an #ifndef so this -D wins.  Without this override the
+    # LM-head kernel does an out-of-bounds read of 148,864 rows past the
+    # codec_head tensor → garbage argmax.
+    f"-DLDG_VOCAB_SIZE={_env_int('LDG_VOCAB_SIZE', 3072)}",
     f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
     f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
     f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",

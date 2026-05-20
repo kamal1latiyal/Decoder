@@ -2,30 +2,42 @@
 TTSPipeline — end-to-end streaming Qwen3-TTS synthesis.
 
 Pipeline stages:
-  text  →  HF talker prefill (text embed + speaker conditioning + KV warm)
-        →  Megakernel codec autoregressive decode  ──┐
-        →  CodePredictor (5-layer subtalker, HF)     │ per token (12.5 Hz)
-        →  Frame buffer (4 frames = 320ms)           │
-        →  CodecDecoder (12Hz tokenizer)             │
-        →  yield PCM bytes  ─────────────────────────┘
+  text  ─▶ HF talker prefill (builds inputs_embeds, runs one talker.model.forward
+                              to warm KV cache, applies codec_head → first group-0 token)
+        ─▶ Megakernel codec decode loop
+              per step:
+                subtalker(group-0, past_hidden) → groups 1..15
+                next_input = Σᵢ embedᵢ(groupᵢ) + trailing_text_hidden[step]
+                kernel.step_from_hidden(next_input) → next group-0 + post-norm hidden
+        ─▶ CodecDecoder (12 Hz tokenizer) → PCM @ 24 kHz mono int16
 
 Backends:
-  backend="megakernel"  (default on CUDA) — uses the qwen_megakernel CUDA op
-                        for the talker's per-token decode loop, HF for prefill.
-  backend="hf"          fallback — pure HF, slow but verified correct. Useful
-                        for sanity checking on hardware where the kernel build
-                        fails, or for A/B comparison.
+  backend="megakernel" (default on CUDA) — uses the qwen_megakernel CUDA op
+                       for the talker's per-token decode loop, HF for prefill + subtalker.
+  backend="hf"         baseline — pure HF wrapper.generate_voice_clone(), full sync.
+                       Verified correct; not low-latency (whole utterance latency = TTFC).
 
-NOTE on the megakernel backend: the KV cache hand-off from HF prefill to the
-kernel requires shape [layers, kv_heads, seq, head_dim] in bf16, contiguous.
-The HF talker's past_key_values use shape [batch, kv_heads, seq, head_dim] per
-layer, which we stack and squeeze. If the talker's HF cache layout changes in
-a future transformers release, MegakernelDecoder.set_kv_prefix() is the spot
-to update.
+KV CACHE HAND-OFF
+-----------------
+HF prefill returns past_key_values as a DynamicCache. Each `cache.layers[i]`
+exposes `.keys` and `.values` of shape [B=1, kv_heads=8, T, head_dim=128].
+We stack across layers and squeeze the batch dim to produce
+[layers=28, kv_heads=8, T, head_dim=128] which MegakernelDecoder.set_kv_prefix
+expects. Verified hardware-side TODO.
+
+MONKEY-PATCH PREFILL
+--------------------
+The wrapper (Qwen3TTSModel.generate_voice_clone) constructs talker_input_embeds
+from text + codec prefill tokens + speaker embed + special tokens. Re-implementing
+that ourselves would duplicate ~80 lines of fragile logic. Instead we replace
+`model.talker.generate` with a one-shot forward, run the wrapper, and intercept
+the result via a sentinel exception. The wrapper builds everything correctly;
+our patched `generate` just stops after prefill and exfiltrates the state.
 """
 
 import asyncio
 import time
+import types
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
 
@@ -39,10 +51,40 @@ from .code_predictor import CodePredictor
 class SynthesisMetrics:
     ttfc_ms: float = 0.0
     rtf: float = 0.0
-    total_tokens: int = 0
-    tokens_per_sec: float = 0.0
+    total_tokens: int = 0          # number of decoded frames (one per codec step)
+    tokens_per_sec: float = 0.0    # talker steps / second (megakernel throughput)
     audio_duration_s: float = 0.0
     wall_time_s: float = 0.0
+
+
+class _PrefillDone(Exception):
+    """Sentinel raised by the monkey-patched talker.generate after one forward pass."""
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+
+def _extract_kv_for_kernel(cache) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a transformers DynamicCache into the layout MegakernelDecoder expects.
+
+    Returns (k, v) each of shape [num_layers, num_kv_heads, prefix_len, head_dim],
+    dtype bf16, contiguous, on cuda.
+    """
+    if not hasattr(cache, "layers"):
+        raise TypeError(
+            f"Expected a DynamicCache (transformers>=4.50); got {type(cache).__name__}. "
+            "If this is a legacy tuple-of-tuples, convert via DynamicCache.from_legacy_cache(...)."
+        )
+    k_list, v_list = [], []
+    for layer in cache.layers:
+        if layer.keys is None or layer.values is None:
+            raise RuntimeError("DynamicCache layer is uninitialised — prefill produced no KV.")
+        # layer.keys / .values shape: [B=1, kv_heads, T, head_dim]
+        k_list.append(layer.keys.squeeze(0))
+        v_list.append(layer.values.squeeze(0))
+    k = torch.stack(k_list, dim=0).contiguous().to(torch.bfloat16)
+    v = torch.stack(v_list, dim=0).contiguous().to(torch.bfloat16)
+    return k, v
 
 
 class TTSPipeline:
@@ -53,6 +95,7 @@ class TTSPipeline:
         chunk_frames: int = MIN_CHUNK_FRAMES,
         ref_audio_path: Optional[str] = None,
         ref_text: Optional[str] = None,
+        language: str = "Auto",
     ):
         if chunk_frames < MIN_CHUNK_FRAMES:
             raise ValueError(f"chunk_frames must be >= {MIN_CHUNK_FRAMES}")
@@ -63,6 +106,7 @@ class TTSPipeline:
         self.chunk_frames = chunk_frames
         self._ref_audio_path = ref_audio_path
         self._ref_text = ref_text
+        self._language = language
 
         print(f"Loading Qwen3-TTS model ({talker_model_id}) for backend={backend}...")
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -72,7 +116,7 @@ class TTSPipeline:
             dtype=torch.bfloat16,
             device_map="cuda",
         )
-        self._model = self._wrapper.model
+        self._model = self._wrapper.model            # Qwen3TTSForConditionalGeneration
         self._processor = self._wrapper.processor
 
         # Subtalker (code predictor) + codec — shared by both backends.
@@ -80,11 +124,9 @@ class TTSPipeline:
         self._predictor = CodePredictor(self._model)
         self._codec = CodecDecoder(self._model)
 
-        # Pre-build voice clone prompt once (if provided). We keep both the
-        # list-of-items form (for the wrapper's `generate_voice_clone`) and the
-        # dict form (for direct `model.generate` calls in the megakernel path).
+        # Pre-build voice clone prompt once (if provided).  The wrapper handles
+        # both ICL (ref_text given) and x-vector-only (ref_text=None) modes.
         self._voice_prompt_items = None
-        self._voice_prompt_dict = None
         if ref_audio_path is not None:
             print(f"Building voice-clone prompt from {ref_audio_path}...")
             self._voice_prompt_items = self._wrapper.create_voice_clone_prompt(
@@ -92,16 +134,16 @@ class TTSPipeline:
                 ref_text=ref_text,
                 x_vector_only_mode=ref_text is None,
             )
-            self._voice_prompt_dict = self._wrapper._prompt_items_to_voice_clone_prompt(
-                self._voice_prompt_items,
-            )
+
+        # Cached configuration values.
+        self._eos_token_id = int(self._model.config.talker_config.codec_eos_token_id)
+        self._max_new_tokens = 2048
 
         if backend == "megakernel":
             print("Pre-compiling megakernel + packing talker weights...")
             from qwen_megakernel_tts.model import TalkerKernelWeights
             from .talker import MegakernelDecoder
-            talker_module = getattr(self._model, "talker", self._model)
-            self._kernel_weights = TalkerKernelWeights(talker_module)
+            self._kernel_weights = TalkerKernelWeights(self._model.talker)
             self._mega = MegakernelDecoder(self._kernel_weights)
 
         self.last_metrics: Optional[SynthesisMetrics] = None
@@ -114,26 +156,33 @@ class TTSPipeline:
     async def _synthesize_hf(self, text: str) -> AsyncGenerator[bytes, None]:
         """
         Baseline: call generate_voice_clone() then stream codec decode over
-        the resulting tokens in chunks.  Not low-latency, but correct.
+        the resulting tokens in chunks.  Not low-latency (HF blocks until full
+        sequence is produced), but correctness-verified by qwen_tts maintainers.
         """
         loop = asyncio.get_event_loop()
 
         def _gen():
-            return self._wrapper.generate_voice_clone(
-                text=text,
-                voice_clone_prompt=self._voice_prompt_items,
-            )
+            kwargs = dict(text=text, language=self._language)
+            if self._voice_prompt_items is not None:
+                kwargs["voice_clone_prompt"] = self._voice_prompt_items
+            else:
+                # No ref audio at all — fall back to x-vector default by passing
+                # ref_audio=None and x_vector_only_mode=True via a noop prompt.
+                # Easiest is to require a ref or use the wrapper's fallback path:
+                # for now, raise so the user sees the explicit requirement.
+                raise RuntimeError(
+                    "HF backend requires a reference voice. Pass ref_audio_path "
+                    "to TTSPipeline(...) or use backend='megakernel' with the "
+                    "default speaker embedding path (which the wrapper supports)."
+                )
+            return self._wrapper.generate_voice_clone(**kwargs)
 
-        # Run blocking generation in a thread so the event loop can yield.
-        # WARNING: HF generate() does not stream; the full sequence comes back
-        # at once. TTFC under this backend is ~ entire-utterance latency.
-        # This backend exists as a correctness baseline, not a perf target.
         wavs, fs = await loop.run_in_executor(None, _gen)
 
+        import numpy as np
         wav = wavs[0]
         if hasattr(wav, "cpu"):
             wav = wav.detach().float().cpu().numpy()
-        import numpy as np
         wav = np.clip(np.asarray(wav, dtype=np.float32), -1.0, 1.0)
         pcm = (wav * 32767.0).astype(np.int16).tobytes()
 
@@ -143,117 +192,156 @@ class TTSPipeline:
             yield pcm[i:i + chunk_bytes]
             await asyncio.sleep(0)
 
+        # HF backend can't break out tokens-per-sec cleanly, so leave that as 0.
+        self._last_total_tokens = 0
+
     # ------------------------------------------------------------------
     # Backend: megakernel (target)
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def _hf_prefill(self, text: str):
+    def _hf_prefill(self, text: str) -> dict:
         """
-        Run the talker's text prefill via HF to:
-          - produce the first codec token
-          - populate the KV cache (which we then hand to the megakernel)
-          - return the talker's last hidden state (for the code predictor)
+        Run the wrapper's text/speaker/codec prefix construction and the talker
+        prefill forward, intercepted via a monkey-patched talker.generate.
 
-        Returns: (first_token: int, k_cache: Tensor, v_cache: Tensor,
-                  last_hidden: Tensor, eos_id: int)
+        Returns dict:
+          first_token          : int                       (talker's first group-0 emission)
+          kv_cache             : DynamicCache              (warm talker KV)
+          last_hidden          : Tensor [1, 1, 1024]       (post-norm hidden at end of prefill)
+          trailing_text_hidden : Tensor [1, K, 1024]       (remaining text for streaming)
+          tts_pad_embed        : Tensor [1, 1, 1024]       (pad embedding for past-trailing steps)
         """
-        # Use the wrapper's tokenization helpers to build the assistant prompt
-        # with the correct special tokens (<|im_start|>assistant\n... etc).
-        assistant_text = self._wrapper._build_assistant_text(text)
-        input_ids = self._wrapper._tokenize_texts([assistant_text])[0]
-
-        # The official model.generate() does all conditioning correctly.
-        # For the megakernel path we instead want the model's prefill state.
-        # We call the talker's prepare-for-generation hook if available,
-        # otherwise fall back to a full forward with output_hidden_states.
-        prepare = getattr(self._model, "prepare_for_kernel_decode", None)
-        if callable(prepare):
-            # Official supported hook (when qwen-tts exposes it).
-            out = prepare(
-                input_ids=input_ids,
-                voice_clone_prompt=self._voice_prompt_dict,
-            )
-            return (
-                int(out["first_codec_token"]),
-                out["k_cache"], out["v_cache"],
-                out["last_hidden"],
-                int(out.get("eos_token_id", 2150)),  # codec_eos_token_id from config
+        if self._voice_prompt_items is None:
+            # Build a default x-vector prompt the first time we synthesize without ref audio.
+            # qwen_tts's wrapper requires either ref_audio or voice_clone_prompt; the simplest
+            # default path is to require the caller pass ref_audio_path to TTSPipeline.
+            # For full prompt-less synthesis we'd need a custom speaker embedding seed.
+            raise RuntimeError(
+                "Megakernel backend currently requires a reference voice "
+                "(ref_audio_path argument to TTSPipeline). Default-voice synthesis "
+                "needs a default x-vector seed that qwen_tts doesn't expose directly."
             )
 
-        # Fallback: HF generate() with max_new_tokens=1, returning past KV.
-        gen_out = self._model.generate(
-            input_ids=input_ids,
-            voice_clone_prompt=self._voice_prompt_dict,
-            max_new_tokens=1,
-            return_dict_in_generate=True,
-            output_scores=False,
-            do_sample=False,
-        )
-        # gen_out.past_key_values: tuple over layers of (k, v) each [B, kv_heads, T, head_dim]
-        pkv = gen_out.past_key_values
-        k_layers = torch.stack([k.squeeze(0) for (k, _) in pkv], dim=0)  # [L, kv_heads, T, head_dim]
-        v_layers = torch.stack([v.squeeze(0) for (_, v) in pkv], dim=0)
-        first_token = int(gen_out.sequences[0, -1].item())
+        captured: dict = {}
 
-        # last hidden state for the code predictor
-        last_hidden = getattr(gen_out, "hidden_states", None)
-        if last_hidden is not None:
-            last_hidden = last_hidden[-1][-1][:, -1, :]  # [1, hidden]
-        else:
-            # Re-run a single-token forward to grab the hidden state.
-            with torch.inference_mode():
-                fwd = self._model.talker(
-                    input_ids=input_ids,
-                    output_hidden_states=True,
-                    use_cache=False,
+        def patched_generate(self_tl, inputs_embeds=None, attention_mask=None,
+                             trailing_text_hidden=None, tts_pad_embed=None, **kw):
+            """
+            Replacement for Qwen3TTSTalkerForConditionalGeneration.generate.
+            Runs ONE forward through the talker's base transformer, captures
+            (kv, last_hidden, first_token), and raises _PrefillDone to break out
+            of the wrapper.
+            """
+            out = self_tl.model.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            # last_hidden_state already has the final norm applied
+            # (Qwen3TTSTalkerModel.forward applies self.norm before returning).
+            last_hidden = out.last_hidden_state[:, -1:, :]            # [1, 1, 1024]
+            logits = self_tl.codec_head(last_hidden)                   # [1, 1, 3072]
+            first_token = int(logits.argmax(dim=-1).item())
+
+            payload = {
+                "first_token": first_token,
+                "kv_cache": out.past_key_values,
+                "last_hidden": last_hidden,
+                "trailing_text_hidden": trailing_text_hidden,
+                "tts_pad_embed": tts_pad_embed,
+            }
+            raise _PrefillDone(payload)
+
+        original = self._model.talker.generate
+        self._model.talker.generate = types.MethodType(patched_generate, self._model.talker)
+        try:
+            try:
+                self._wrapper.generate_voice_clone(
+                    text=text,
+                    language=self._language,
+                    voice_clone_prompt=self._voice_prompt_items,
+                    do_sample=False,                    # greedy for determinism
+                    max_new_tokens=1,                   # honoured nowhere because we raise first
                 )
-                last_hidden = fwd.hidden_states[-1][:, -1, :]
+            except _PrefillDone as done:
+                captured = done.payload
+            else:
+                raise RuntimeError(
+                    "Monkey-patched prefill did not fire — wrapper completed without "
+                    "calling talker.generate. Did qwen_tts change its generate path?"
+                )
+        finally:
+            self._model.talker.generate = original
 
-        eos_id = int(getattr(self._model.config.talker_config, "codec_eos_token_id", 2150))
-        return first_token, k_layers, v_layers, last_hidden, eos_id
+        return captured
 
     async def _synthesize_megakernel(self, text: str) -> AsyncGenerator[bytes, None]:
         loop = asyncio.get_event_loop()
-        first_token, k_pref, v_pref, last_hidden, eos_id = await loop.run_in_executor(
-            None, self._hf_prefill, text
-        )
+        payload = await loop.run_in_executor(None, self._hf_prefill, text)
 
+        first_token: int = payload["first_token"]
+        kv_cache = payload["kv_cache"]
+        last_hidden: torch.Tensor = payload["last_hidden"]               # [1, 1, 1024]
+        trailing_text_hidden: torch.Tensor = payload["trailing_text_hidden"]  # [1, K, 1024]
+        tts_pad_embed: torch.Tensor = payload["tts_pad_embed"]           # [1, 1, 1024]
+
+        # Push KV prefix into the kernel.
+        k_pref, v_pref = _extract_kv_for_kernel(kv_cache)
         self._mega.reset()
         self._mega.set_kv_prefix(k_pref, v_pref)
         self._codec.reset()
 
+        eos_id = self._eos_token_id
+        trailing_len = trailing_text_hidden.shape[1]
+        device = last_hidden.device
+        dtype = last_hidden.dtype
+
+        token = first_token
+        past_hidden = last_hidden                # [1, 1, 1024]
+        step = 0
         frame_buffer: list[list[int]] = []
         total_tokens = 0
 
-        # First frame: use the HF-prefill output token directly (no kernel call yet).
-        token = first_token
-        while token != eos_id and total_tokens < 4096:
-            frame = self._predictor.predict(token, last_hidden)
+        while token != eos_id and total_tokens < self._max_new_tokens:
+            # Run subtalker → full 16-group frame + summed codec embedding.
+            frame, codec_hidden_sum = await loop.run_in_executor(
+                None,
+                lambda t=token, h=past_hidden: self._predictor.predict(t, h),
+            )
             frame_buffer.append(frame)
             total_tokens += 1
 
             if len(frame_buffer) >= self.chunk_frames:
-                pcm = self._codec.decode(frame_buffer)
+                pcm = await loop.run_in_executor(
+                    None, self._codec.decode, list(frame_buffer)
+                )
                 frame_buffer.clear()
                 if pcm:
                     yield pcm
 
-            await asyncio.sleep(0)
-            # NOTE: step() returns next codec token AND updates KV cache in-place.
-            token = self._mega.step(token)
-            # The kernel doesn't expose hidden state; predictor uses prior hidden.
-            # Acceptable approximation — predictor is robust to one-step-stale conditioning
-            # because the talker hidden changes slowly across adjacent codec tokens.
+            # Build next-step input embedding (matches talker.forward, lines 1687–1692).
+            if step < trailing_len:
+                next_input = codec_hidden_sum + trailing_text_hidden[:, step : step + 1]
+            else:
+                next_input = codec_hidden_sum + tts_pad_embed
+            next_input = next_input.to(device=device, dtype=dtype).reshape(-1)  # [1024]
 
-        # Flush any tail frames (only if we have enough for one decode call).
+            # Kernel step → next group-0 token + post-norm hidden.
+            token, post_norm = self._mega.step_from_hidden(next_input)
+            past_hidden = post_norm.view(1, 1, -1)
+            step += 1
+
+            await asyncio.sleep(0)  # yield to event loop so PCM dispatch interleaves
+
+        # Flush any trailing frames (only if we have enough for one codec decode).
         if len(frame_buffer) >= MIN_CHUNK_FRAMES:
-            pcm = self._codec.decode(frame_buffer)
+            pcm = await loop.run_in_executor(
+                None, self._codec.decode, list(frame_buffer)
+            )
             if pcm:
                 yield pcm
 
-        # total_tokens is the count of frames we ran through the predictor.
-        # We expose it on self for the outer synthesize() to compute metrics.
         self._last_total_tokens = total_tokens
 
     # ------------------------------------------------------------------
@@ -263,14 +351,18 @@ class TTSPipeline:
     async def synthesize(self, text: str, speaker: str = "default") -> AsyncGenerator[bytes, None]:
         """
         Yields PCM byte chunks as they are produced. After the generator
-        completes, self.last_metrics holds TTFC/RTF/tok-s.
+        completes, `self.last_metrics` holds TTFC/RTF/tok-per-s.
         """
         t_start = time.perf_counter()
         t_first_chunk: Optional[float] = None
         total_audio_bytes = 0
         self._last_total_tokens = 0
 
-        gen = self._synthesize_megakernel(text) if self.backend == "megakernel" else self._synthesize_hf(text)
+        gen = (
+            self._synthesize_megakernel(text)
+            if self.backend == "megakernel"
+            else self._synthesize_hf(text)
+        )
 
         async for pcm in gen:
             if t_first_chunk is None:
