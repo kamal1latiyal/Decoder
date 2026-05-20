@@ -86,11 +86,19 @@ def s3():
     )
     print(f"  model class : {type(wrapper.model).__name__}")
     print(f"  tts_model_type : {wrapper.model.tts_model_type}")
-    # Probe subtalker / codec attribute presence.
-    has_st = any(hasattr(wrapper.model, n) for n in ("subtalker", "code_predictor", "talker_code_predictor"))
-    has_codec = hasattr(wrapper.model, "speech_tokenizer")
-    print(f"  subtalker present       : {has_st}")
+    # Probe submodule presence at the REAL attribute paths used by our pipeline:
+    #   model.talker.code_predictor  (the subtalker — qwen_tts naming)
+    #   model.speech_tokenizer       (the codec)
+    talker = getattr(wrapper.model, "talker", None)
+    has_st = (
+        talker is not None
+        and any(hasattr(talker, n) for n in ("code_predictor", "subtalker", "talker_code_predictor"))
+    )
+    has_codec = hasattr(wrapper.model, "speech_tokenizer") and wrapper.model.speech_tokenizer is not None
+    print(f"  talker present          : {talker is not None}")
+    print(f"  subtalker present       : {has_st}  (at model.talker.code_predictor)")
     print(f"  speech_tokenizer present: {has_codec}")
+    assert talker is not None, "no model.talker — pipeline assumes Qwen3-TTS Base"
     assert has_st, "no subtalker — CodePredictor wrapper will fail"
     assert has_codec, "no speech_tokenizer — CodecDecoder wrapper will fail"
     return wrapper
