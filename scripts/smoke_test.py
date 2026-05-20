@@ -177,53 +177,56 @@ def s_parity(wrapper, kw):
     from tts.talker import MegakernelDecoder
     from tts.pipeline import _extract_kv_for_kernel
 
-    torch.manual_seed(42)
-    device = next(wrapper.model.parameters()).device
-    dtype = next(wrapper.model.parameters()).dtype
-    assert dtype == torch.bfloat16, f"expected talker in bf16, got {dtype}"
-
-    talker = wrapper.model.talker            # Qwen3TTSTalkerForConditionalGeneration
-    talker_model = talker.model              # Qwen3TTSTalkerModel (the 28-layer backbone)
-
-    # 1. Random prefix in embedding space.  Small scale so values stay in the
-    #    bf16 sweet spot and we don't trigger numerical edge cases.
-    prefix_len = 8
-    prefix = (torch.randn(1, prefix_len, 1024, device=device) * 0.1).to(dtype)
-    print(f"  prefix shape={tuple(prefix.shape)} dtype={prefix.dtype}")
-
-    # 2. HF prefill — capture KV BEFORE we run the next-step forward (which
-    #    mutates the DynamicCache in place).
+    # Single inference_mode block for the whole stage. Tensors produced inside
+    # cannot leave for autograd-tracked code (linear with Parameter weights);
+    # codec_head's forward goes through autograd if called outside, so we keep
+    # everything inside one consistent inference_mode context.
     with torch.inference_mode():
+        torch.manual_seed(42)
+        device = next(wrapper.model.parameters()).device
+        dtype = next(wrapper.model.parameters()).dtype
+        assert dtype == torch.bfloat16, f"expected talker in bf16, got {dtype}"
+
+        talker = wrapper.model.talker            # Qwen3TTSTalkerForConditionalGeneration
+        talker_model = talker.model              # Qwen3TTSTalkerModel (the 28-layer backbone)
+
+        # 1. Random prefix in embedding space.  Small scale so values stay in
+        #    the bf16 sweet spot and we don't trigger numerical edge cases.
+        prefix_len = 8
+        prefix = (torch.randn(1, prefix_len, 1024, device=device) * 0.1).to(dtype)
+        print(f"  prefix shape={tuple(prefix.shape)} dtype={prefix.dtype}")
+
+        # 2. HF prefill — capture KV BEFORE we run the next-step forward
+        #    (which mutates the DynamicCache in place).
         prefill_out = talker_model.forward(
             inputs_embeds=prefix, use_cache=True, output_hidden_states=False,
         )
-    kv_for_kernel_k, kv_for_kernel_v = _extract_kv_for_kernel(prefill_out.past_key_values)
-    print(f"  KV extracted             : k={tuple(kv_for_kernel_k.shape)} "
-          f"v={tuple(kv_for_kernel_v.shape)}  dtype={kv_for_kernel_k.dtype}")
-    assert kv_for_kernel_k.shape == (28, 8, prefix_len, 128), kv_for_kernel_k.shape
+        kv_for_kernel_k, kv_for_kernel_v = _extract_kv_for_kernel(prefill_out.past_key_values)
+        print(f"  KV extracted             : k={tuple(kv_for_kernel_k.shape)} "
+              f"v={tuple(kv_for_kernel_v.shape)}  dtype={kv_for_kernel_k.dtype}")
+        assert kv_for_kernel_k.shape == (28, 8, prefix_len, 128), kv_for_kernel_k.shape
 
-    # 3. Random next-step input vector (1024-dim bf16).
-    next_input = (torch.randn(1024, device=device) * 0.1).to(dtype)
+        # 3. Random next-step input vector (1024-dim bf16).
+        next_input = (torch.randn(1024, device=device) * 0.1).to(dtype)
 
-    # 4. HF: one more step from the warm cache.
-    with torch.inference_mode():
+        # 4. HF: one more step from the warm cache.
         hf_step = talker_model.forward(
             inputs_embeds=next_input.view(1, 1, 1024),
             past_key_values=prefill_out.past_key_values,
             use_cache=True,
             output_hidden_states=False,
         )
-    hf_hidden = hf_step.last_hidden_state[0, -1, :].to(torch.float32)        # [1024]
-    hf_logits = talker.codec_head(hf_step.last_hidden_state[:, -1, :])[0]    # [3072]
-    hf_topk = torch.topk(hf_logits, 5)
-    hf_token = int(hf_topk.indices[0].item())
+        hf_hidden = hf_step.last_hidden_state[0, -1, :].to(torch.float32)        # [1024]
+        hf_logits = talker.codec_head(hf_step.last_hidden_state[:, -1, :])[0]    # [3072]
+        hf_topk = torch.topk(hf_logits, 5)
+        hf_token = int(hf_topk.indices[0].item())
 
-    # 5. Kernel: same warm KV (captured pre-mutation), same next_input.
-    dec = MegakernelDecoder(kw)
-    dec.reset()
-    dec.set_kv_prefix(kv_for_kernel_k, kv_for_kernel_v)
-    kernel_token, kernel_hidden_bf16 = dec.step_from_hidden(next_input)
-    kernel_hidden = kernel_hidden_bf16.to(torch.float32).view(-1)             # [1024]
+        # 5. Kernel: same warm KV (captured pre-mutation), same next_input.
+        dec = MegakernelDecoder(kw)
+        dec.reset()
+        dec.set_kv_prefix(kv_for_kernel_k, kv_for_kernel_v)
+        kernel_token, kernel_hidden_bf16 = dec.step_from_hidden(next_input)
+        kernel_hidden = kernel_hidden_bf16.to(torch.float32).view(-1)             # [1024]
 
     # 6. Diagnostics.
     abs_diff = (kernel_hidden - hf_hidden).abs()
