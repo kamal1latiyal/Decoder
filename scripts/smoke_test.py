@@ -17,6 +17,12 @@ import time
 import traceback
 from pathlib import Path
 
+# Make `qwen_megakernel_tts` (repo-root package) importable when invoked as
+# `python scripts/smoke_test.py` from anywhere.
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 OK = "\033[32m✓\033[0m"
 NO = "\033[31m✗\033[0m"
 
