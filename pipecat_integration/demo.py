@@ -1,5 +1,20 @@
 """
-Full Pipecat voice pipeline demo: STT → LLM → Megakernel TTS → audio output.
+Pipecat voice pipeline reference: STT → LLM → Megakernel TTS → audio output.
+
+This is the canonical Pipecat-library integration: it composes a real
+Pipecat `Pipeline([...])` with Deepgram STT, Anthropic LLM, our
+`MegakernelTTSService`, and a `WebsocketServerTransport`. The TTSService
+class is defined in `tts_service.py`.
+
+Pipecat's `WebsocketServerTransport` uses Protobuf framing on the wire,
+so connecting a *client* to this server requires either Pipecat's
+Python client SDK or a hand-written Protobuf-aware client. For the
+live take-home demo we use a simpler raw-PCM WebSocket server
+(`pipecat_integration/voice_loop.py`) that pairs with a tiny
+`sounddevice` client (`scripts/voice_loop_client.py`) — same architecture,
+same Deepgram + Claude + Megakernel-TTS pipeline, less protocol
+complexity. This file remains as the canonical Pipecat wiring per the
+take-home spec; voice_loop.py is the runnable equivalent.
 
 Pipeline:
   Microphone (WebSocket transport)
@@ -7,14 +22,6 @@ Pipeline:
     → Claude Opus 4.7 (claude-opus-4-7)
     → MegakernelTTSService
     → Speaker (WebSocket transport)
-
-Run (after starting the TTS server):
-  export DEEPGRAM_API_KEY=...
-  export ANTHROPIC_API_KEY=...
-  python pipecat_integration/demo.py
-
-For a local audio demo (no WebSocket client needed):
-  python pipecat_integration/demo.py --local
 """
 
 import argparse

@@ -44,11 +44,9 @@ class CodecDecoder:
                 "Did you load Qwen3TTSForConditionalGeneration?"
             )
         self._history_frames: list[list[int]] = []   # last OVERLAP_FRAMES we already emitted
-        self._emitted_samples: int = 0               # cumulative samples already pushed out
 
     def reset(self) -> None:
         self._history_frames = []
-        self._emitted_samples = 0
 
     @property
     def sample_rate(self) -> int:

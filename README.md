@@ -75,13 +75,39 @@ python -m server.app --host 0.0.0.0 --port 8765 \
     --ref-audio "$REF_AUDIO" --ref-text "$REF_TEXT"
 ```
 
-### Running the Pipecat voice loop (after the server is up)
+### Running the live voice-agent loop (after bootstrap completes)
+
+The simplest live demo uses the raw-PCM voice loop server + a `sounddevice`
+client. Walkie-talkie style: press Enter to speak, Enter again to send,
+hear the agent reply in your cloned voice.
+
+**On the 5090 box** (the megakernel TTS server is already running on :8765
+from bootstrap):
 
 ```bash
-export DEEPGRAM_API_KEY=...
-export ANTHROPIC_API_KEY=...
-python pipecat_integration/demo.py
+# Start the STT → LLM → TTS orchestrator on :8766
+python -m pipecat_integration.voice_loop --port 8766 --tts-url ws://localhost:8765
 ```
+
+**On your laptop**, in two terminals:
+
+```bash
+# Terminal A — tunnel the voice-loop port to localhost
+ssh -p <SSH_PORT> -N -L 8766:localhost:8766 root@<VAST_IP>
+
+# Terminal B — install client deps once, then run
+python3 -m pip install --user sounddevice websockets numpy
+python3 scripts/voice_loop_client.py
+```
+
+Speak. The client prints the transcript, the LLM reply text, and per-turn
+latency (STT / LLM / TTS / total), while the cloned-voice audio plays
+through your speakers.
+
+The full Pipecat-library wiring (Deepgram + Claude + MegakernelTTSService
+under a real `Pipeline([...])`) is in `pipecat_integration/demo.py` for
+reference; `voice_loop.py` is the simpler raw-PCM equivalent used for the
+live demo.
 
 ### Quick WebSocket sanity check
 
