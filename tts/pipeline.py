@@ -44,7 +44,7 @@ from typing import AsyncGenerator, Optional
 import torch
 
 from .codec import CodecDecoder, MIN_CHUNK_FRAMES, SAMPLE_RATE
-from .code_predictor import CodePredictor
+from .code_predictor import CodePredictor, CUDAGraphedCodePredictor
 
 
 @dataclass
@@ -96,7 +96,17 @@ class TTSPipeline:
         ref_audio_path: Optional[str] = None,
         ref_text: Optional[str] = None,
         language: str = "Auto",
+        use_cuda_graph: bool = True,
     ):
+        """
+        Args:
+            use_cuda_graph: when True (default) and backend == 'megakernel',
+                use the CUDAGraphedCodePredictor — captures the subtalker's
+                15-step decode into a single CUDA graph, ~8x faster per
+                frame than HF's GenerationMixin path. Set False to A/B
+                against the HF reference. Greedy-only (no sampling)
+                because graph capture needs deterministic ops.
+        """
         if chunk_frames < MIN_CHUNK_FRAMES:
             raise ValueError(f"chunk_frames must be >= {MIN_CHUNK_FRAMES}")
         if backend not in ("megakernel", "hf"):
@@ -107,6 +117,7 @@ class TTSPipeline:
         self._ref_audio_path = ref_audio_path
         self._ref_text = ref_text
         self._language = language
+        self._use_cuda_graph = use_cuda_graph and backend == "megakernel"
 
         print(f"Loading Qwen3-TTS model ({talker_model_id}) for backend={backend}...")
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -120,8 +131,21 @@ class TTSPipeline:
         self._processor = self._wrapper.processor
 
         # Subtalker (code predictor) + codec — shared by both backends.
-        print("Wrapping code predictor + codec...")
-        self._predictor = CodePredictor(self._model)
+        # CUDA-graphed predictor is the optimised path; falls back to HF
+        # CodePredictor on capture failure or when use_cuda_graph=False.
+        if self._use_cuda_graph:
+            print("Wrapping code predictor (CUDA-graphed, greedy) + codec...")
+            try:
+                self._predictor = CUDAGraphedCodePredictor(self._model)
+                print("  ✓ CUDA graph captured for subtalker")
+            except Exception as e:
+                print(f"  ⚠ CUDA graph capture failed: {e!r}")
+                print("  ↳ falling back to HF CodePredictor (slower)")
+                self._predictor = CodePredictor(self._model)
+                self._use_cuda_graph = False
+        else:
+            print("Wrapping code predictor (HF reference) + codec...")
+            self._predictor = CodePredictor(self._model)
         self._codec = CodecDecoder(self._model)
 
         # Pre-build voice clone prompt once (if provided).  The wrapper handles

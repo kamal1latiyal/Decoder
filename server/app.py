@@ -30,6 +30,9 @@ from tts.pipeline import TTSPipeline, SynthesisMetrics
 _BACKEND = os.environ.get("TTS_BACKEND", "megakernel")
 _REF_AUDIO = os.environ.get("TTS_REF_AUDIO") or None
 _REF_TEXT = os.environ.get("TTS_REF_TEXT") or None
+# CUDA-graphed subtalker is enabled by default for the megakernel backend.
+# Disable via env var or `--no-cuda-graph` to A/B against the HF reference.
+_USE_CUDA_GRAPH = os.environ.get("TTS_USE_CUDA_GRAPH", "1") not in ("0", "false", "False")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ async def load_pipeline():
             backend=_BACKEND,
             ref_audio_path=_REF_AUDIO,
             ref_text=_REF_TEXT,
+            use_cuda_graph=_USE_CUDA_GRAPH,
         )
 
     _pipeline = await loop.run_in_executor(None, _build)
@@ -178,6 +182,8 @@ def main():
                         help="Path to reference wav for voice cloning. If omitted, x-vector default voice is used.")
     parser.add_argument("--ref-text", default=_REF_TEXT,
                         help="Transcript of the reference audio (required for ICL mode).")
+    parser.add_argument("--no-cuda-graph", action="store_true",
+                        help="Disable the CUDA-graphed subtalker (A/B against HF reference).")
     args = parser.parse_args()
 
     # Propagate to the startup event via env (uvicorn re-imports the module).
@@ -186,6 +192,8 @@ def main():
         os.environ["TTS_REF_AUDIO"] = args.ref_audio
     if args.ref_text:
         os.environ["TTS_REF_TEXT"] = args.ref_text
+    if args.no_cuda_graph:
+        os.environ["TTS_USE_CUDA_GRAPH"] = "0"
 
     uvicorn.run(
         "server.app:app",
