@@ -145,8 +145,20 @@ class CUDAGraphedCodePredictor:
     PREFILL_LEN = 2                             # past_hidden + g0_embed
     MAX_CACHE_LEN = PREFILL_LEN + NUM_SUB_STEPS - 1   # 16 — worst-case KV positions
 
-    def __init__(self, qwen3_tts_model: torch.nn.Module):
+    def __init__(self, qwen3_tts_model: torch.nn.Module, enable_compile: bool = False):
+        """
+        Args:
+            enable_compile: when True, wrap the manual decode loop in
+                torch.compile(mode='reduce-overhead'). DEFAULT FALSE because
+                torch.compile's inductor backend regularly fails on this
+                workload (HF mask creation + weakref-on-storage races) AND
+                its failure path can corrupt PyTorch's dispatcher state,
+                breaking unrelated tensor creation downstream. Even without
+                compilation, the manual decode loop alone is ~3-5× faster
+                than HF GenerationMixin (verified 21× on CPU).
+        """
         from transformers.cache_utils import StaticCache
+        self._enable_compile = enable_compile
 
         talker = qwen3_tts_model.talker
         self._subtalker = talker.code_predictor
@@ -216,17 +228,14 @@ class CUDAGraphedCodePredictor:
             for i in range(1, self.NUM_SUB_STEPS)
         ]
 
-        # Strategy: use torch.compile(mode="reduce-overhead") for the inner
-        # decode loop. It internally uses CUDA graphs where safe and handles
-        # the rough edges (HF mask creation, StaticCache update, etc.) that
-        # raw torch.cuda.graph() rejects with "CPU tensor not pinned".
-        #
-        # If torch.compile is unavailable or errors at compile time, we still
-        # benefit from the manual decode loop (which bypasses HF's
-        # GenerationMixin Python overhead — proved 21× on CPU).
+        # Strategy: by default we ONLY use the manual decode loop (which
+        # bypasses HF's GenerationMixin Python overhead — proved 21× on CPU,
+        # estimated 3-5× on GPU). torch.compile is opt-in because its failure
+        # path can corrupt PyTorch's dispatcher state, breaking downstream
+        # tensor creation. See `enable_compile` docstring above.
         self._compiled_loop = None
         self._using_compile = False
-        if not self._cpu_test_mode:
+        if not self._cpu_test_mode and self._enable_compile:
             self._setup_compiled_loop()
 
     # ──────────────────────────────────────────────────────────────────
@@ -340,9 +349,24 @@ class CUDAGraphedCodePredictor:
             self._compiled_loop = compiled
             self._using_compile = True
         except Exception as e:
-            # Compile failed — we still have the (uncompiled) manual decode
-            # loop, which is itself 3-5× faster than HF GenerationMixin.
-            print(f"  ⚠ torch.compile failed: {e!r}")
+            # Compile failed — clean up PyTorch's internal state so downstream
+            # tensor creation (e.g. CodecDecoder's torch.zeros buffer) doesn't
+            # hit the corrupted dispatcher: "INTERNAL ASSERT FAILED ... Hit
+            # PythonDispatcher dispatch key but PythonDispatcherTLS was not set".
+            try:
+                import torch._dynamo
+                torch._dynamo.reset()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+            # We still have the (uncompiled) manual decode loop, which is
+            # itself 3-5× faster than HF GenerationMixin.
+            print(f"  ⚠ torch.compile failed: {type(e).__name__}: {str(e)[:200]}")
             print(f"  ↳ using uncompiled manual decode loop (still ~3-5× faster than HF generate)")
             self._compiled_loop = None
             self._using_compile = False

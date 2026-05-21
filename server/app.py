@@ -40,6 +40,9 @@ _REF_TEXT = os.environ.get("TTS_REF_TEXT") or None
 # CUDA-graphed subtalker is enabled by default for the megakernel backend.
 # Disable via env var or `--no-cuda-graph` to A/B against the HF reference.
 _USE_CUDA_GRAPH = os.environ.get("TTS_USE_CUDA_GRAPH", "1") not in ("0", "false", "False")
+# torch.compile on the manual decode loop. OFF by default — its failure mode
+# is "dispatcher corruption" which breaks downstream code. Opt in to A/B.
+_ENABLE_COMPILE = os.environ.get("TTS_ENABLE_COMPILE", "0") not in ("0", "false", "False")
 # Codec chunking knobs — lower chunk_frames cuts TTFC, raise overlap_frames
 # to maintain quality. Defaults match the pre-existing 4/4 behaviour.
 _CHUNK_FRAMES = int(os.environ.get("TTS_CHUNK_FRAMES", "4"))
@@ -72,6 +75,7 @@ async def load_pipeline():
             use_cuda_graph=_USE_CUDA_GRAPH,
             chunk_frames=_CHUNK_FRAMES,
             overlap_frames=_OVERLAP_FRAMES,
+            enable_compile=_ENABLE_COMPILE,
         )
 
     _pipeline = await loop.run_in_executor(None, _build)
@@ -196,7 +200,10 @@ def main():
     parser.add_argument("--ref-text", default=_REF_TEXT,
                         help="Transcript of the reference audio (required for ICL mode).")
     parser.add_argument("--no-cuda-graph", action="store_true",
-                        help="Disable the CUDA-graphed subtalker (A/B against HF reference).")
+                        help="Disable the manual decode loop (A/B against HF reference).")
+    parser.add_argument("--enable-compile", action="store_true",
+                        help="(EXPERIMENTAL) wrap manual loop in torch.compile. "
+                             "Risky — inductor failure can corrupt PyTorch dispatcher.")
     parser.add_argument("--chunk-frames", type=int, default=_CHUNK_FRAMES,
                         help=("How many new codec frames per decode call. Default 4. "
                               "Lower = lower TTFC, but more codec calls per second of audio. "
@@ -213,6 +220,8 @@ def main():
         os.environ["TTS_REF_TEXT"] = args.ref_text
     if args.no_cuda_graph:
         os.environ["TTS_USE_CUDA_GRAPH"] = "0"
+    if args.enable_compile:
+        os.environ["TTS_ENABLE_COMPILE"] = "1"
     os.environ["TTS_CHUNK_FRAMES"] = str(args.chunk_frames)
     os.environ["TTS_OVERLAP_FRAMES"] = str(args.overlap_frames)
 

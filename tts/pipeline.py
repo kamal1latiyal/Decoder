@@ -98,6 +98,7 @@ class TTSPipeline:
         ref_text: Optional[str] = None,
         language: str = "Auto",
         use_cuda_graph: bool = True,
+        enable_compile: bool = False,
     ):
         """
         Args:
@@ -109,11 +110,12 @@ class TTSPipeline:
                 chunk. Default 4. Raise when chunk_frames is small (1-2) to
                 keep audio quality steady.
             use_cuda_graph: when True (default) and backend == 'megakernel',
-                use the CUDAGraphedCodePredictor — captures the subtalker's
-                15-step decode into a single CUDA graph, ~8x faster per
-                frame than HF's GenerationMixin path. Set False to A/B
-                against the HF reference. Greedy-only (no sampling)
-                because graph capture needs deterministic ops.
+                use the CUDAGraphedCodePredictor — replaces HF's
+                GenerationMixin with a manual 15-step decode loop. Greedy
+                only. Set False to A/B against the HF reference.
+            enable_compile: when True, additionally wrap the manual loop in
+                torch.compile(mode='reduce-overhead'). Default False — see
+                CUDAGraphedCodePredictor's docstring for why.
         """
         if chunk_frames < MIN_CHUNK_FRAMES:
             raise ValueError(f"chunk_frames must be >= {MIN_CHUNK_FRAMES}")
@@ -127,6 +129,7 @@ class TTSPipeline:
         self._ref_text = ref_text
         self._language = language
         self._use_cuda_graph = use_cuda_graph and backend == "megakernel"
+        self._enable_compile = enable_compile
 
         print(f"Loading Qwen3-TTS model ({talker_model_id}) for backend={backend}...")
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -146,13 +149,16 @@ class TTSPipeline:
         # bypasses HF GenerationMixin overhead — 3-5× win on its own.
         # Full fallback to CodePredictor only happens on construction failure.
         if self._use_cuda_graph:
-            print("Wrapping code predictor (manual loop + torch.compile) + codec...")
+            mode_desc = "manual loop + torch.compile" if enable_compile else "manual loop"
+            print(f"Wrapping code predictor ({mode_desc}) + codec...")
             try:
-                self._predictor = CUDAGraphedCodePredictor(self._model)
+                self._predictor = CUDAGraphedCodePredictor(
+                    self._model, enable_compile=enable_compile,
+                )
                 if self._predictor._using_compile:
                     print("  ✓ torch.compile applied to subtalker decode loop")
                 else:
-                    print("  ↳ using uncompiled manual loop (still 3-5× faster than HF generate)")
+                    print("  ↳ using manual loop (3-5× faster than HF generate, no compile)")
             except Exception as e:
                 print(f"  ⚠ CUDAGraphedCodePredictor construction failed: {e!r}")
                 print("  ↳ falling back to HF CodePredictor (slowest)")
