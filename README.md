@@ -169,6 +169,37 @@ bypasses `GenerationMixin` with a manual subtalker forward loop would close
 
 Raw logs in `benchmarks/results/*.log` (uploaded with this repo).
 
+### Future work — closing the perf gap
+
+The remaining gap to the < 90 ms TTFC / < 0.3 RTF targets is **not** in the
+megakernel itself (which hits 1248 tok/s isolated, ~25 % above its reference).
+It's in HF's `GenerationMixin.generate()` invoked once per audio frame for
+the 5-layer subtalker — about 30–50 ms of Python orchestration cost ×
+12.5 frames per second.
+
+Three concrete optimizations, in order of expected payoff:
+
+1. **Fuse the subtalker into its own megakernel** — same trick as
+   AlpinDale's for the talker, applied to the 5-layer predictor.
+   `Imtoocompedidiv/qwen-tts-turbo` demonstrates this approach achieves
+   ~11 ms TTFP on RTX 5090 by fusing the predictor and eliminating the
+   per-frame Python loop. Applied here (where the talker already runs on
+   the megakernel), this would close the largest remaining bottleneck and
+   bring TTFC under ~100 ms / RTF under ~0.2.
+
+2. **Bypass `GenerationMixin` with a manual subtalker forward loop** —
+   no kernel work needed, just direct `subtalker.model.forward()` calls
+   in a 15-step Python loop. Skips ~30 ms of `generate()` boilerplate
+   per frame. Estimated ~3-5× speedup over current pipeline, no risk to
+   correctness. Easiest next step.
+
+3. **Reduce TTFC's hard floor (4-frame buffer)** — the codec needs ≥4
+   frames per decode call (~320 ms of audio). Investigating whether the
+   12 Hz tokenizer's internal sliding window allows decoding earlier
+   chunks would cut TTFC by up to 240 ms. Requires reading
+   `qwen_tts.core.tokenizer_12hz` and possibly patching it. Lower
+   payoff than (1) or (2) since RTF is the bigger miss.
+
 ---
 
 ## Backends
