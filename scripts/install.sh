@@ -71,43 +71,32 @@ fi
 echo ""
 echo "[3/6] Setting up Python environment..."
 VENV_DIR="${REPO_DIR}/.venv"
-# --system-site-packages so NGC / vast.ai images' pre-installed PyTorch is
-# visible inside the venv. Without this, we'd shadow NGC's CUDA-13-optimised
-# PyTorch with a cu128 wheel — works but wastes ~3 min and the optimisations.
+# Clean venv WITHOUT --system-site-packages.  Using it sounds nice ("reuse
+# NGC's CUDA-13 PyTorch") but breaks when pip then installs a torchaudio that
+# doesn't match the inherited torch's ABI — symptom is:
+#   undefined symbol: torch_dtype_float4_e2m1fn_x2
+# So we always install our own ABI-consistent {torch, torchvision, torchaudio}
+# trio from the cu128 wheel index. ~3 min download once per box; bulletproof.
 if [ ! -d "${VENV_DIR}" ]; then
-    python3 -m venv --system-site-packages "${VENV_DIR}"
-    echo "  Created venv (with --system-site-packages) at ${VENV_DIR}"
+    python3 -m venv "${VENV_DIR}"
+    echo "  Created venv at ${VENV_DIR}"
 fi
 source "${VENV_DIR}/bin/activate"
 echo "  Activated: $(which python)"
 
-# ── 4. PyTorch ──────────────────────────────────────────────────
+# ── 4. PyTorch (always install the cu128 trio for ABI consistency) ──
 echo ""
-echo "[4/6] Checking / installing PyTorch (need >= 2.7 with CUDA)..."
+echo "[4/6] Installing matching torch + torchvision + torchaudio (cu128)..."
 pip install --upgrade pip --quiet
-
-# Detect whether a usable PyTorch is already present.  NGC / Vast templates
-# usually ship a CUDA-matched PyTorch 2.7+; if so we use it as-is.  Otherwise
-# we install from the cu128 wheel index (compatible with CUDA 12.8 ≤ X < 14).
-if python -c "
-import sys
-try:
-    import torch
-    v = torch.__version__.split('+')[0].split('a')[0].split('.dev')[0]
-    major, minor = [int(x) for x in v.split('.')[:2]]
-    ok = (major, minor) >= (2, 7) and torch.cuda.is_available()
-    sys.exit(0 if ok else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null; then
-    echo "  ✓ Existing PyTorch is usable: $(python -c 'import torch; print(torch.__version__)')"
-    echo "    CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
-else
-    echo "  No usable PyTorch found — installing cu128 wheels..."
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --quiet
-    echo "  PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
-    echo "  CUDA available : $(python -c 'import torch; print(torch.cuda.is_available())')"
-fi
+# Force-reinstall so a partially-broken state (e.g. mismatched torchaudio
+# left over from a previous run with --system-site-packages) gets corrected.
+pip install --force-reinstall --upgrade \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128 --quiet
+echo "  torch       : $(python -c 'import torch; print(torch.__version__)')"
+echo "  torchaudio  : $(python -c 'import torchaudio; print(torchaudio.__version__)')"
+echo "  torchvision : $(python -c 'import torchvision; print(torchvision.__version__)')"
+echo "  CUDA avail  : $(python -c 'import torch; print(torch.cuda.is_available())')"
 
 # ── 5. Python dependencies ──────────────────────────────────────
 echo ""
