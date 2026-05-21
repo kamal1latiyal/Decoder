@@ -255,14 +255,13 @@ async def health():
 
 
 def main():
+    global TTS_URL
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8766)
     p.add_argument("--tts-url", default=TTS_URL,
                    help="Megakernel TTS server URL (default: ws://localhost:8765)")
     args = p.parse_args()
-
-    global TTS_URL
     TTS_URL = args.tts_url
 
     import uvicorn
