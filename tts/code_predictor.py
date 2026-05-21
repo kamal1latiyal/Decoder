@@ -253,11 +253,11 @@ class CUDAGraphedCodePredictor:
         # Take the hidden at position 1 (the g0 slot, second of two prefill positions).
         hidden = out.last_hidden_state[:, -1:, :]                              # [1, 1, 1024]
         token_0 = self._lm_heads[0](hidden).argmax(dim=-1).squeeze()           # group-1 token id
-        # Use index_copy_ so the write is captured as a static op (not a
-        # Python-side assignment which CUDA graphs can't see).
-        self._static_out_tokens.index_copy_(
-            0, torch.tensor([0], device=self.device, dtype=torch.long), token_0.unsqueeze(0)
-        )
+        # Use narrow().copy_() instead of index_copy_(torch.tensor(...)) — the
+        # latter creates a fresh CPU index tensor inside the captured graph,
+        # which CUDA graph capture forbids (the host→device copy isn't pinned).
+        # narrow() with a Python int just rewrites stride math, no allocations.
+        self._static_out_tokens.narrow(0, 0, 1).copy_(token_0.unsqueeze(0))
 
         # Initialise the codec_hidden_sum with embed(g0) (talker's group-0 embed).
         codec_hidden_sum = g0_embed.clone()                                    # [1, 1, 1024]
@@ -281,9 +281,8 @@ class CUDAGraphedCodePredictor:
             )
             hidden = out.last_hidden_state                                     # [1, 1, 1024]
             token_i = self._lm_heads[step](hidden).argmax(dim=-1).squeeze()
-            self._static_out_tokens.index_copy_(
-                0, torch.tensor([step], device=self.device, dtype=torch.long), token_i.unsqueeze(0)
-            )
+            # narrow() with Python int — no in-graph CPU tensor allocation.
+            self._static_out_tokens.narrow(0, step, 1).copy_(token_i.unsqueeze(0))
 
             # Accumulate group-`step` embedding into the codec_hidden_sum.
             codec_hidden_sum = codec_hidden_sum + step_embed
