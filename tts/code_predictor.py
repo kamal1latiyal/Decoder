@@ -169,10 +169,10 @@ class CUDAGraphedCodePredictor:
 
         self.device = next(talker.parameters()).device
         self.dtype = next(talker.parameters()).dtype
-        if self.device.type != "cuda":
-            raise RuntimeError(
-                "CUDAGraphedCodePredictor requires CUDA. Use CodePredictor on CPU."
-            )
+        # CPU mode is supported for math-correctness testing only — the graph
+        # capture is skipped and predict() just calls _run_decode_loop directly
+        # each time (no perf benefit, but the same numerical path).
+        self._cpu_test_mode = self.device.type != "cuda"
 
         H = self._subtalker.config.hidden_size
 
@@ -217,7 +217,8 @@ class CUDAGraphedCodePredictor:
         ]
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
-        self._warm_and_capture()
+        if not self._cpu_test_mode:
+            self._warm_and_capture()
 
     # ──────────────────────────────────────────────────────────────────
     @torch.inference_mode()
@@ -343,11 +344,13 @@ class CUDAGraphedCodePredictor:
         self._static_past_hidden.copy_(past_hidden.to(self.device, self.dtype))
         self._static_g0_token.fill_(int(group0_token))
 
-        # Replay the graph — single CUDA submission, no Python in the hot path.
-        self._graph.replay()
-
-        # Sync so we can read the int outputs back.
-        torch.cuda.synchronize()
+        if self._graph is not None:
+            # Replay the graph — single CUDA submission, no Python in the hot path.
+            self._graph.replay()
+            torch.cuda.synchronize()
+        else:
+            # CPU test mode — run the same decode loop directly.
+            self._run_decode_loop()
 
         # Build the frame list: [group0_token] + the 15 sampled subtalker tokens.
         frame_tail = self._static_out_tokens.tolist()
