@@ -116,6 +116,12 @@ class CodePredictor:
         last_id_hidden = self._group0_embed(g0_id)                  # [1, 1, 1024]
 
         # Run the subtalker for 15 steps to emit groups 1..15.
+        # NB: output_hidden_states was True in an earlier version — that forces
+        # HF's GenerationMixin to collect 5 layers × 15 steps = 75 hidden-state
+        # tensors per frame which we never use (the kernel exposes its own
+        # post-norm hidden via MegakernelDecoder.norm_out). At 12.5 frames/sec
+        # that was ~940 unnecessary allocations/sec and dominated wall time.
+        # We only need `.sequences`, so skip the dict and the hidden-state plumbing.
         result = self._subtalker.generate(
             inputs_embeds=torch.cat([past_hidden, last_id_hidden], dim=1),  # [1, 2, 1024]
             max_new_tokens=NUM_CODE_GROUPS - 1,
@@ -123,10 +129,14 @@ class CodePredictor:
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
+            return_dict_in_generate=False,   # plain Tensor return, no dict
+            use_cache=True,                  # explicit (default-ish, document intent)
         )
-        seq = result.sequences                                       # [1, 15]
+        # When return_dict_in_generate=False, generate() returns the full id tensor
+        # including the prompt prefix. We sliced it to keep only the new tokens.
+        # inputs_embeds prefix length = 2 (past_hidden + last_id_hidden); the
+        # subtalker emits 15 new ids after that.
+        seq = result[:, -((NUM_CODE_GROUPS - 1)):]                   # [1, 15]
         if seq.shape[-1] != NUM_CODE_GROUPS - 1:
             raise RuntimeError(
                 f"Subtalker emitted {seq.shape[-1]} tokens, expected "
