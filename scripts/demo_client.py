@@ -28,6 +28,7 @@ import sys
 import time
 import wave
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import sounddevice as sd
@@ -46,7 +47,7 @@ SAMPLE_RATE = 24_000   # server emits 24 kHz mono int16
 
 
 async def synthesize_one(server_url: str, text: str, *,
-                          save_path: Path | None = None) -> dict:
+                          save_path: Optional[Path] = None) -> dict:
     """Send one text, stream audio chunks, play them live, return metrics."""
     ws_url = f"{server_url}/synthesize"
 
@@ -61,10 +62,10 @@ async def synthesize_one(server_url: str, text: str, *,
     )
     stream.start()
 
-    chunks: list[bytes] = []
-    chunk_arrivals: list[float] = []
-    first_chunk_t: float | None = None
-    server_metrics: dict | None = None
+    chunks: list = []
+    chunk_arrivals: list = []
+    first_chunk_t: Optional[float] = None
+    server_metrics: Optional[dict] = None
 
     try:
         async with websockets.connect(ws_url, max_size=10 * 1024 * 1024) as ws:
@@ -127,7 +128,7 @@ def print_metrics(label: str, text: str, m: dict) -> None:
         print(f"   Chunk cadence : ~{m['median_chunk_ms']:.0f} ms between chunks")
 
 
-async def main_async(server_url: str, save_dir: Path | None) -> None:
+async def main_async(server_url: str, save_dir: Optional[Path]) -> None:
     print("=" * 68)
     print(" Decoder voice-agent demo — megakernel TTS streaming")
     print(f" Server: {server_url}")
