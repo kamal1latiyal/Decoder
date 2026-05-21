@@ -112,14 +112,62 @@ python benchmarks/bench_rtf.py  --runs 5
 python benchmarks/bench_e2e.py
 ```
 
-| Metric         | Target  | Measured (megakernel) | Measured (hf baseline) |
-|----------------|---------|-----------------------|------------------------|
-| Talker tok/s   | ~1000   | TBD                   | TBD                    |
-| TTFC           | < 90 ms | TBD                   | TBD                    |
-| RTF            | < 0.3   | TBD                   | TBD                    |
-| E2E latency    | —       | TBD                   | TBD                    |
+### Measured on a single RTX 5090 (Vast.ai, CUDA 13.0, May 2026)
 
-*Numbers go here after the first hardware run.*
+| Metric                                    | Target   | Measured       |
+|-------------------------------------------|----------|----------------|
+| Kernel tok/s (isolated, 50-step warm)     | ~1000    | **1248**       |
+| Kernel ↔ HF post-norm hidden cosine       | -        | **0.9998**     |
+| Kernel ↔ HF argmax token agreement        | -        | **identical**  |
+| TTFC (warm, median over 25 runs)          | < 90 ms  | **~260 ms**    |
+| RTF (median over 9 runs)                  | < 0.3    | **0.746**      |
+| Talker throughput (full pipeline)         | -        | ~17 tok/s      |
+| Streaming chunk-by-chunk (vs buffered)    | required | **yes** (~320 ms cadence) |
+| Audio quality (your voice cloned)         | clean    | **yes**        |
+
+The kernel itself hits the throughput target with ~25 % headroom. The two
+TTFC/RTF targets are missed by ~3× and ~2.5× respectively. **The bottleneck is
+not the kernel** — it is HF's `GenerationMixin.generate()` invoked once per
+audio frame for the subtalker. Each call has ~30–50 ms of Python orchestration
+cost, multiplied by 12.5 frames per second of audio. A future revision that
+bypasses `GenerationMixin` with a manual subtalker forward loop would close
+~5–10× of the per-frame overhead, putting the pipeline back near the targets.
+
+### What was changed to get these numbers
+
+- Patched the upstream kernel's hardcoded `LDG_VOCAB_SIZE=151936` (Qwen3-0.6B
+  text vocab) to `3072` (Qwen3-TTS codec head) via an **idempotent** in-place
+  edit in `scripts/install.sh` plus a `-DLDG_VOCAB_SIZE` build flag. Without
+  this the LM-head kernel reads ~148 K rows past the codec_head tensor → garbage.
+- Replaced the original `subtalker.generate(..., output_hidden_states=True,
+  return_dict_in_generate=True)` with the minimal-overhead version (we only
+  use `.sequences`). The discarded 75 hidden-state tensors per frame were
+  dominating wall time at 12.5 frames/sec.
+- Fixed a sample-accounting bug in `tts/codec.py` that truncated megakernel
+  audio after the first chunk: `_emitted_samples` was tracking the *current*
+  decoded wav's length rather than cumulative emitted samples; with 4-frame
+  overlap windows this caused every chunk after the first to emit zero.
+- Capped `max_new_tokens` at 128 (≈10 s of audio) because greedy decoding in
+  the kernel does not reliably emit the codec EOS token — uncapped runs
+  would burn ~2 minutes of compute per request before hitting the upstream
+  cap of 2048.
+- Added a **CPU-only integration test** (`scripts/test_cpu_integration.py`)
+  that loads the real `qwen_tts` model + your reference wav and exercises
+  the entire HF-side path (monkey-patched prefill, `_extract_kv_for_kernel`,
+  `CodePredictor.predict`) without CUDA. This caught the vocab hardcode and
+  three API-mismatch bugs locally, before renting a single GPU minute.
+
+### Benchmark methodology
+
+- TTFC: `benchmarks/bench_ttfc.py --runs 5` — 5 representative sentences,
+  5 runs each; first-run-of-server includes ~5 s of one-time CUDA init.
+  Reported median is across the 24 warm runs.
+- RTF: `benchmarks/bench_rtf.py --runs 3` — 3 runs × 3 sentences,
+  wall-time / generated-audio-duration.
+- E2E: `benchmarks/bench_e2e.py` — single composite run that also
+  verifies streaming (multiple PCM chunks vs single bulk push).
+
+Raw logs in `benchmarks/results/*.log` (uploaded with this repo).
 
 ---
 
@@ -139,8 +187,9 @@ pipeline when the kernel needs debugging.
 
 | File | Status |
 |---|---|
-| `csrc/kernel.cu`, `csrc/torch_bindings.cpp` | Unmodified — symlinked from `AlpinDale/qwen_megakernel`. |
-| `qwen_megakernel_tts/build.py` | JIT compile. Flags match upstream verbatim (LDG_PREFETCH_*, USE_UINT4, ATTENTION_VEC4, WEIGHT_LDCS, MLP_SMEM, `-arch=sm_120a`). No `LDG_VOCAB_SIZE` flag (none exists upstream). |
+| `csrc/kernel.cu` | **One-line patch** applied by `install.sh`: wraps the hardcoded `constexpr int LDG_VOCAB_SIZE = 151936` in `#ifndef … #endif` so a build flag controls vocab. Otherwise unmodified. |
+| `csrc/torch_bindings.cpp` | Unmodified — symlinked from `AlpinDale/qwen_megakernel`. |
+| `qwen_megakernel_tts/build.py` | JIT compile. Flags match upstream verbatim (LDG_PREFETCH_*, USE_UINT4, ATTENTION_VEC4, WEIGHT_LDCS, MLP_SMEM, `-arch=sm_120a`) **plus** `-DLDG_VOCAB_SIZE=3072` for the Qwen3-TTS codec head. |
 | `qwen_megakernel_tts/model.py` | Extracts the talker's codec-side weights from a loaded `Qwen3TTSForConditionalGeneration` and packs them into the `LDGLayerWeights[28]` C struct layout. |
 | `tts/talker.py` | `MegakernelDecoder` — single-step `torch.ops.qwen_megakernel_C.decode` wrapper. RoPE θ=1,000,000. KV-prefix injection for HF→kernel hand-off. |
 | `tts/code_predictor.py` | Thin wrapper over the loaded model's subtalker (5 layers, HF). |
