@@ -32,6 +32,17 @@ import time
 import wave
 from pathlib import Path
 
+# Install uvloop before any asyncio import — it's a drop-in replacement for the
+# default asyncio event loop that's ~2-4× faster (lower per-task scheduling cost,
+# more efficient I/O via libuv). At 12.5 frames/sec of audio + WS dispatch +
+# subtalker awaits, this shaves a few ms off the per-second budget.
+# Falls back to default asyncio if uvloop isn't installed (e.g. on Windows).
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
 import requests
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect

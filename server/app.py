@@ -18,6 +18,13 @@ import os
 import time
 from typing import Optional
 
+# uvloop = faster asyncio event loop (~2-4× lower scheduling cost). Drop-in.
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
 import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
