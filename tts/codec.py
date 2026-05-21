@@ -35,6 +35,12 @@ OVERLAP_FRAMES = 4                                  # frames carried across call
 class CodecDecoder:
     """Streaming wrapper over qwen3_tts.speech_tokenizer."""
 
+    # Codec input is bounded: history (≤ OVERLAP_FRAMES) + new frames per call.
+    # In practice the pipeline calls with `chunk_frames` new frames each time,
+    # so the worst-case input length is OVERLAP_FRAMES + chunk_frames. We
+    # pre-allocate slightly more to be safe (avoid re-allocations).
+    _MAX_INPUT_FRAMES = 32   # 4 overlap + up to 28 new frames per call
+
     def __init__(self, qwen3_tts_model: torch.nn.Module):
         self.device = next(qwen3_tts_model.parameters()).device
         self._tokenizer = getattr(qwen3_tts_model, "speech_tokenizer", None)
@@ -44,6 +50,13 @@ class CodecDecoder:
                 "Did you load Qwen3TTSForConditionalGeneration?"
             )
         self._history_frames: list[list[int]] = []   # last OVERLAP_FRAMES we already emitted
+
+        # Pre-allocate the codec input tensor — avoids per-call torch.tensor()
+        # which is ~0.5-2 ms on GPU due to host→device copy + alloc overhead.
+        # Sized for the worst case; we slice to the actual length per call.
+        self._codes_buf = torch.zeros(
+            self._MAX_INPUT_FRAMES, 16, dtype=torch.long, device=self.device,
+        )
 
     def reset(self) -> None:
         self._history_frames = []
@@ -80,7 +93,20 @@ class CodecDecoder:
 
         all_frames = self._history_frames + frames
         new_frame_count = len(frames)
-        codes_2d = torch.tensor(all_frames, dtype=torch.long, device=self.device)  # [T, 16]
+        n_total = len(all_frames)
+        if n_total > self._MAX_INPUT_FRAMES:
+            # Should never happen in practice (overlap=4 + chunk=4 = 8), but
+            # be defensive: fall back to per-call allocation if someone calls
+            # with a huge chunk.
+            codes_2d = torch.tensor(all_frames, dtype=torch.long, device=self.device)
+        else:
+            # Reuse the pre-allocated buffer: copy ids in (host → device) then
+            # slice to the actual length. `as_tensor` avoids one extra copy
+            # relative to `torch.tensor` when the source is already a list.
+            self._codes_buf[:n_total].copy_(
+                torch.as_tensor(all_frames, dtype=torch.long)
+            )
+            codes_2d = self._codes_buf[:n_total]
         wavs, fs = self._tokenizer.decode([{"audio_codes": codes_2d}])
         assert fs == SAMPLE_RATE, f"Codec sample rate {fs} != expected {SAMPLE_RATE}"
         wav = wavs[0]
