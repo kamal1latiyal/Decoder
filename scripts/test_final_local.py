@@ -180,7 +180,7 @@ def section_e():
     wrapper = _load_wrapper()
     ref = CodePredictor(wrapper.model)
     cgp = CUDAGraphedCodePredictor(wrapper.model)
-    print(f"  cpu_test_mode={cgp._cpu_test_mode}, graph={cgp._graph}")
+    print(f"  cpu_test_mode={cgp._cpu_test_mode}, using_compile={cgp._using_compile}")
 
     torch.manual_seed(42)
     H = wrapper.model.talker.code_predictor.config.hidden_size

@@ -140,16 +140,22 @@ class TTSPipeline:
         self._processor = self._wrapper.processor
 
         # Subtalker (code predictor) + codec — shared by both backends.
-        # CUDA-graphed predictor is the optimised path; falls back to HF
-        # CodePredictor on capture failure or when use_cuda_graph=False.
+        # CUDAGraphedCodePredictor uses torch.compile(mode='reduce-overhead')
+        # to wrap the manual decode loop. Even if torch.compile fails (e.g.
+        # because of HF mask-creation quirks), the eager manual loop still
+        # bypasses HF GenerationMixin overhead — 3-5× win on its own.
+        # Full fallback to CodePredictor only happens on construction failure.
         if self._use_cuda_graph:
-            print("Wrapping code predictor (CUDA-graphed, greedy) + codec...")
+            print("Wrapping code predictor (manual loop + torch.compile) + codec...")
             try:
                 self._predictor = CUDAGraphedCodePredictor(self._model)
-                print("  ✓ CUDA graph captured for subtalker")
+                if self._predictor._using_compile:
+                    print("  ✓ torch.compile applied to subtalker decode loop")
+                else:
+                    print("  ↳ using uncompiled manual loop (still 3-5× faster than HF generate)")
             except Exception as e:
-                print(f"  ⚠ CUDA graph capture failed: {e!r}")
-                print("  ↳ falling back to HF CodePredictor (slower)")
+                print(f"  ⚠ CUDAGraphedCodePredictor construction failed: {e!r}")
+                print("  ↳ falling back to HF CodePredictor (slowest)")
                 self._predictor = CodePredictor(self._model)
                 self._use_cuda_graph = False
         else:

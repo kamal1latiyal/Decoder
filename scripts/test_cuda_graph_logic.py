@@ -64,7 +64,7 @@ def main():
     print(f"    {OK} CodePredictor (HF reference)")
     cgp = CUDAGraphedCodePredictor(model)
     print(f"    {OK} CUDAGraphedCodePredictor "
-          f"(cpu_test_mode={cgp._cpu_test_mode}, graph={cgp._graph})")
+          f"(cpu_test_mode={cgp._cpu_test_mode}, using_compile={cgp._using_compile})")
 
     # ── 3. Prepare a representative input ─────────────────────────────
     # Real past_hidden would come from MegakernelDecoder.step_from_hidden's
