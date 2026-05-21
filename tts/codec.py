@@ -62,20 +62,27 @@ class CodecDecoder:
     def decode(self, frames: list[list[int]]) -> bytes:
         """
         Decode the newest `frames` (each a list of 16 codebook ids) into PCM.
-        Returns only the audio samples that haven't been emitted before.
 
-        Sample-accurate truncation against `_emitted_samples` makes the stream
-        gap-free even though we re-decode the overlap each call.
+        Streaming strategy: decode `history + frames` together so the codec
+        has its causal context, then emit ONLY the samples corresponding to
+        the new `frames` (the trailing block of the decoded wav).
+
+        PREVIOUS BUG (now fixed): the old version tracked `_emitted_samples`
+        as `wav.shape[0]` (the cumulative length of the *current* decode).
+        After the first chunk, every subsequent decode of `[history(4) +
+        new(4)]` produces the same total length (8 frames worth ≈ 15,360
+        samples), so `skip_samples >= wav.shape[0]` and zero new samples
+        were emitted. Audio truncated silently after one chunk.
+        Fix: slice the trailing `len(frames) * SAMPLES_PER_FRAME` samples.
         """
         if len(frames) < MIN_CHUNK_FRAMES:
             raise ValueError(
                 f"Need at least {MIN_CHUNK_FRAMES} frames per decode; got {len(frames)}"
             )
 
-        # Concatenate overlap (already-emitted tail) + new frames, decode together.
         all_frames = self._history_frames + frames
+        new_frame_count = len(frames)
         codes_2d = torch.tensor(all_frames, dtype=torch.long, device=self.device)  # [T, 16]
-        # speech_tokenizer.decode() expects per-sample dicts of {"audio_codes": [T, Q]}
         wavs, fs = self._tokenizer.decode([{"audio_codes": codes_2d}])
         assert fs == SAMPLE_RATE, f"Codec sample rate {fs} != expected {SAMPLE_RATE}"
         wav = wavs[0]
@@ -83,15 +90,15 @@ class CodecDecoder:
             wav = wav.detach().float().cpu().numpy()
         wav = np.asarray(wav, dtype=np.float32).reshape(-1)
 
-        # Drop the leading samples corresponding to already-emitted frames.
-        # Use sample-accurate count rather than frames*1920 to avoid drift on
-        # codecs that produce slightly fewer samples at sequence start.
-        skip_samples = self._emitted_samples
-        new_wav = wav[skip_samples:] if skip_samples < wav.shape[0] else wav[:0]
+        # Emit only the trailing window corresponding to the *new* frames.
+        # This is intentionally frame-count-based, not absolute-sample-based:
+        # the codec output for `history + new` is a fresh decode each call,
+        # not a continuation of the prior wav, so tracking cumulative emitted
+        # samples doesn't make sense.
+        new_samples = min(new_frame_count * SAMPLES_PER_FRAME, wav.shape[0])
+        new_wav = wav[-new_samples:]
 
-        self._emitted_samples = wav.shape[0]
-
-        # Rotate history: keep the last OVERLAP_FRAMES of frames for next call's context.
+        # Rotate history: keep last OVERLAP_FRAMES for next call's causal context.
         keep = OVERLAP_FRAMES if len(all_frames) > OVERLAP_FRAMES else len(all_frames)
         self._history_frames = list(all_frames[-keep:])
 

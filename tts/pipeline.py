@@ -137,7 +137,12 @@ class TTSPipeline:
 
         # Cached configuration values.
         self._eos_token_id = int(self._model.config.talker_config.codec_eos_token_id)
-        self._max_new_tokens = 2048
+        # Frame cap. 12.5 Hz frame rate, so 128 frames ≈ 10s of audio per
+        # request — plenty for a conversational voice agent. Lower than the
+        # upstream cap (2048 ≈ 164s) because the megakernel uses greedy decoding
+        # which sometimes fails to emit eos. With sampling-aware decoding this
+        # could safely go higher; greedy works best with a tight bound.
+        self._max_new_tokens = 128
 
         if backend == "megakernel":
             print("Pre-compiling megakernel + packing talker weights...")
