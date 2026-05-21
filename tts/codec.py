@@ -19,9 +19,11 @@ Future v2: hook the codec decoder's internal sliding-window state directly
 to avoid the overlap re-decode.
 """
 
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import torch
-from typing import Optional
 
 
 SAMPLE_RATE = 24_000
@@ -48,6 +50,18 @@ MIN_CHUNK_FRAMES = 1
 # Legacy alias still used by pipeline.py / scripts; equals current default.
 MIN_CHUNK_SAMPLES = DEFAULT_CHUNK_FRAMES * SAMPLES_PER_FRAME  # 7680
 OVERLAP_FRAMES = DEFAULT_OVERLAP_FRAMES
+
+
+@dataclass
+class _DecodeHandle:
+    """Handle returned by CodecDecoder.submit(). Holds a reference to the
+    in-flight GPU work + the new_frame_count needed to slice the trailing
+    PCM window from the eventual wav. Pass to .collect() to sync and read."""
+    wav_tensor: Optional[torch.Tensor]      # GPU wav tensor, in-flight
+    event: Optional[object]                  # torch.cuda.Event recorded on codec_stream, or None on CPU
+    new_frame_count: int
+    # On CPU fallback path, .pcm holds the already-computed bytes directly.
+    pcm: Optional[bytes] = None
 
 
 class CodecDecoder:
@@ -99,6 +113,14 @@ class CodecDecoder:
             self._MAX_INPUT_FRAMES, 16, dtype=torch.long, device=self.device,
         )
 
+        # Dedicated CUDA stream for codec ops so they can overlap with talker
+        # work on the default stream. None on CPU — submit()/collect() degrade
+        # to a synchronous in-line call there.
+        if self.device.type == "cuda":
+            self._codec_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream(device=self.device)
+        else:
+            self._codec_stream = None
+
     def reset(self) -> None:
         self._history_frames = []
 
@@ -117,21 +139,16 @@ class CodecDecoder:
         return self._overlap_frames
 
     @torch.inference_mode()
-    def decode(self, frames: list[list[int]]) -> bytes:
+    def submit(self, frames: list[list[int]]) -> _DecodeHandle:
         """
-        Decode the newest `frames` (each a list of 16 codebook ids) into PCM.
+        Submit a codec decode to the codec CUDA stream and return a handle.
+        Does NOT block until completion — caller is free to issue more talker
+        work on the default stream while the codec runs in parallel.
 
-        Streaming strategy: decode `history + frames` together so the codec
-        has its causal context, then emit ONLY the samples corresponding to
-        the new `frames` (the trailing block of the decoded wav).
+        On CPU (no CUDA stream available), this collapses to a synchronous
+        decode and returns a handle with `.pcm` pre-filled.
 
-        PREVIOUS BUG (now fixed): the old version tracked `_emitted_samples`
-        as `wav.shape[0]` (the cumulative length of the *current* decode).
-        After the first chunk, every subsequent decode of `[history(4) +
-        new(4)]` produces the same total length (8 frames worth ≈ 15,360
-        samples), so `skip_samples >= wav.shape[0]` and zero new samples
-        were emitted. Audio truncated silently after one chunk.
-        Fix: slice the trailing `len(frames) * SAMPLES_PER_FRAME` samples.
+        Pair with .collect(handle) to get the PCM bytes (may block).
         """
         if len(frames) < self._chunk_frames:
             raise ValueError(
@@ -141,37 +158,86 @@ class CodecDecoder:
         all_frames = self._history_frames + frames
         new_frame_count = len(frames)
         n_total = len(all_frames)
+
+        # Rotate history NOW (before submit) so the caller sees the updated
+        # state immediately; the GPU work continues async on its own stream
+        # and doesn't touch _history_frames.
+        keep = min(self._overlap_frames, len(all_frames))
+        self._history_frames = list(all_frames[-keep:])
+
+        # Stage codec ids into pre-allocated GPU buffer.
         if n_total > self._MAX_INPUT_FRAMES:
-            # Should never happen in practice (overlap=4 + chunk=4 = 8), but
-            # be defensive: fall back to per-call allocation if someone calls
-            # with a huge chunk.
             codes_2d = torch.tensor(all_frames, dtype=torch.long, device=self.device)
         else:
-            # Reuse the pre-allocated buffer: copy ids in (host → device) then
-            # slice to the actual length. `as_tensor` avoids one extra copy
-            # relative to `torch.tensor` when the source is already a list.
             self._codes_buf[:n_total].copy_(
                 torch.as_tensor(all_frames, dtype=torch.long)
             )
             codes_2d = self._codes_buf[:n_total]
-        wavs, fs = self._tokenizer.decode([{"audio_codes": codes_2d}])
-        assert fs == SAMPLE_RATE, f"Codec sample rate {fs} != expected {SAMPLE_RATE}"
-        wav = wavs[0]
+
+        # CPU path: just decode synchronously, return a handle with pcm baked in.
+        if self._codec_stream is None:
+            wavs, fs = self._tokenizer.decode([{"audio_codes": codes_2d}])
+            assert fs == SAMPLE_RATE, f"Codec sample rate {fs} != expected {SAMPLE_RATE}"
+            wav = wavs[0]
+            if isinstance(wav, torch.Tensor):
+                wav = wav.detach().float().cpu().numpy()
+            wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+            pcm = _slice_and_pack(wav, new_frame_count)
+            return _DecodeHandle(wav_tensor=None, event=None, new_frame_count=new_frame_count, pcm=pcm)
+
+        # GPU path: run the codec on the codec stream. Make sure the codec
+        # stream sees the codes_2d writes from the default stream (we just
+        # copy_'d into _codes_buf on the default stream).
+        self._codec_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._codec_stream):
+            wavs, fs = self._tokenizer.decode([{"audio_codes": codes_2d}])
+            assert fs == SAMPLE_RATE, f"Codec sample rate {fs} != expected {SAMPLE_RATE}"
+            wav_tensor = wavs[0]
+            # Don't .cpu() here — that would force a sync. Just hold the GPU
+            # tensor and let .collect() do the host copy when the consumer
+            # actually needs the bytes.
+
+        event = torch.cuda.Event()
+        event.record(self._codec_stream)
+
+        return _DecodeHandle(
+            wav_tensor=wav_tensor,
+            event=event,
+            new_frame_count=new_frame_count,
+            pcm=None,
+        )
+
+    def collect(self, handle: _DecodeHandle) -> bytes:
+        """
+        Block until the submit's codec work is done, then return PCM bytes.
+        Idempotent: calling collect() twice on the same handle returns the
+        same bytes (no re-sync, no re-copy) thanks to the .pcm cache.
+        """
+        if handle.pcm is not None:
+            return handle.pcm
+
+        # Wait for the codec stream to finish this handle's work.
+        if handle.event is not None:
+            handle.event.synchronize()
+
+        wav = handle.wav_tensor
         if isinstance(wav, torch.Tensor):
             wav = wav.detach().float().cpu().numpy()
         wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+        pcm = _slice_and_pack(wav, handle.new_frame_count)
+        handle.pcm = pcm  # cache for any future .collect() on this handle
+        return pcm
 
-        # Emit only the trailing window corresponding to the *new* frames.
-        # This is intentionally frame-count-based, not absolute-sample-based:
-        # the codec output for `history + new` is a fresh decode each call,
-        # not a continuation of the prior wav, so tracking cumulative emitted
-        # samples doesn't make sense.
-        new_samples = min(new_frame_count * SAMPLES_PER_FRAME, wav.shape[0])
-        new_wav = wav[-new_samples:]
+    def decode(self, frames: list[list[int]]) -> bytes:
+        """Synchronous decode for backwards compatibility / simple use.
+        Equivalent to submit(frames) immediately followed by collect()."""
+        return self.collect(self.submit(frames))
 
-        # Rotate history: keep last overlap_frames for next call's causal context.
-        keep = min(self._overlap_frames, len(all_frames))
-        self._history_frames = list(all_frames[-keep:])
 
-        clipped = np.clip(new_wav, -1.0, 1.0)
-        return (clipped * 32767.0).astype(np.int16).tobytes()
+def _slice_and_pack(wav: np.ndarray, new_frame_count: int) -> bytes:
+    """Take the codec's float32 wav, slice trailing `new_frame_count *
+    SAMPLES_PER_FRAME` samples, clip + pack to int16 PCM."""
+    new_samples = min(new_frame_count * SAMPLES_PER_FRAME, wav.shape[0])
+    new_wav = wav[-new_samples:]
+    clipped = np.clip(new_wav, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()

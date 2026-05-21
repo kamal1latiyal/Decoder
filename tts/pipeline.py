@@ -341,6 +341,13 @@ class TTSPipeline:
         frame_buffer: list[list[int]] = []
         total_tokens = 0
 
+        # Deferred codec collection — submit a chunk to the codec stream,
+        # let it run in parallel with the NEXT talker iteration, then collect
+        # right before submitting the NEXT chunk. On GPU this lets the codec
+        # decode overlap with talker work (codec is ~5-15 ms, talker step
+        # ~10 ms, both run on different SMs).
+        pending_handle = None
+
         while token != eos_id and total_tokens < self._max_new_tokens:
             # Run subtalker → full 16-group frame + summed codec embedding.
             frame, codec_hidden_sum = await loop.run_in_executor(
@@ -351,12 +358,22 @@ class TTSPipeline:
             total_tokens += 1
 
             if len(frame_buffer) >= self.chunk_frames:
-                pcm = await loop.run_in_executor(
-                    None, self._codec.decode, list(frame_buffer)
+                # Collect the PREVIOUS chunk's PCM (it's been running on the
+                # codec stream in parallel with the talker steps that just
+                # filled this new frame_buffer — typically already done).
+                if pending_handle is not None:
+                    pcm = await loop.run_in_executor(None, self._codec.collect, pending_handle)
+                    pending_handle = None
+                    if pcm:
+                        yield pcm
+
+                # Submit the new chunk on the codec stream and continue —
+                # don't wait. The next talker iterations will run on the
+                # default stream concurrently with this codec call.
+                pending_handle = await loop.run_in_executor(
+                    None, self._codec.submit, list(frame_buffer)
                 )
                 frame_buffer.clear()
-                if pcm:
-                    yield pcm
 
             # Build next-step input embedding (matches talker.forward, lines 1687–1692).
             if step < trailing_len:
@@ -372,8 +389,16 @@ class TTSPipeline:
 
             await asyncio.sleep(0)  # yield to event loop so PCM dispatch interleaves
 
+        # Flush: collect any pending codec work and yield it.
+        if pending_handle is not None:
+            pcm = await loop.run_in_executor(None, self._codec.collect, pending_handle)
+            pending_handle = None
+            if pcm:
+                yield pcm
+
         # Flush any trailing frames (only if we have enough for one codec decode).
-        if len(frame_buffer) >= MIN_CHUNK_FRAMES:
+        # Uses the codec's configured chunk threshold, not the legacy floor.
+        if len(frame_buffer) >= self._codec.min_chunk_frames:
             pcm = await loop.run_in_executor(
                 None, self._codec.decode, list(frame_buffer)
             )
