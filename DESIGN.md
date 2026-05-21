@@ -297,19 +297,18 @@ Numbers from the RTX 5090 run (Vast.ai, CUDA 13.0, May 2026). Raw logs in
 |---------------------------------------|------------|-----------------------|
 | Kernel tok/s (isolated, 50 warm steps)| ~1,000     | **1,248** (25 % over) |
 | Kernel ↔ HF post-norm hidden cosine   | —          | **0.999802**          |
-| Kernel ↔ HF argmax token agreement    | —          | **identical**         |
-| TTFC (warm median, 25 runs)           | < 90 ms    | **~260 ms**           |
-| RTF (median, 9 runs)                  | < 0.3      | **0.746**             |
-| RTF std-dev                           | —          | 0.003 (very stable)   |
-| Talker tok/s (full pipeline)          | —          | ~17                   |
-| Streaming chunk cadence               | required   | ~320 ms (8 chunks/s)  |
+| Kernel ↔ HF argmax token agreement    | —          | **identical** (38 = 38) |
+| TTFC (warm median, 25 runs)           | < 90 ms    | **~403 ms**           |
+| RTF (median, 9 runs)                  | < 0.3      | **~1.15**             |
+| Talker tok/s (full pipeline)          | —          | ~11                   |
+| Streaming chunk cadence               | required   | ~320 ms (32 chunks per 10 s utterance) |
 | Cloned-voice audio quality            | acceptable | clean, your voice     |
 
 The kernel itself hits the throughput target with headroom. The end-to-end
-metrics miss the TTFC and RTF targets by ~3× and ~2.5× respectively. **The
+metrics miss the TTFC and RTF targets by ~4.5× and ~3.8× respectively. **The
 bottleneck is not the kernel** — it is HF's `GenerationMixin.generate()`
 called once per audio frame for the 5-layer subtalker (~30–50 ms of Python
-orchestration cost × 12.5 frames/s ≈ 0.4–0.6 s of overhead per second of
+orchestration cost × 12.5 frames/s ≈ 0.5–0.7 s of overhead per second of
 audio). The kernel call itself adds only ~1–2 ms per step.
 
 Where the budget for one second of audio actually goes:
@@ -318,15 +317,27 @@ Where the budget for one second of audio actually goes:
 |------------------------------------------|----------------------------------|
 | HF talker prefill (one-time, amortised)  | ~50 ms (one-time per request)    |
 | Megakernel talker decode (12.5 steps)    | ~15–25 ms                        |
-| HF subtalker per frame (12.5 × ~50 ms)   | ~625 ms                          |
+| HF subtalker per frame (12.5 × ~70 ms)   | ~870 ms                          |
 | Codec decode (every 4 frames)            | ~50 ms                           |
 | Asyncio + tensor ops orchestration       | ~50 ms                           |
-| **Observed total per 1 s audio**         | **~750 ms (RTF ≈ 0.75)**         |
+| **Observed total per 1 s audio**         | **~1,150 ms (RTF ≈ 1.15)**       |
 
-A subtalker megakernel would replace the ~625 ms subtalker line with
+A subtalker megakernel would replace the ~870 ms subtalker line with
 something like ~25 ms (mirroring the talker kernel ratio), bringing total
-per 1 s audio to ~150 ms (RTF ~0.15) — putting the pipeline well under
-the target. See README "Future work" for details.
+per 1 s audio to ~190 ms (RTF ~0.19) — putting the pipeline well under the
+target. See README "Future work — closing the perf gap" for the three
+ranked optimization paths.
+
+### Note on the earlier 260 ms / 0.75 numbers in commit history
+
+An earlier benchmark run reported TTFC ≈ 260 ms and RTF ≈ 0.75. Those
+numbers were artificially low because the codec sample-tracking bug
+(fixed in commit `b12835f`) was silently truncating each utterance after
+the first chunk. TTFC was measured against that first (and only) chunk;
+the apparent "good" RTF reflected ~0.6 s of synthesis producing
+~0.8 s of audio before the truncation kicked in. The numbers above are
+from after the fix, with full 10.24 s utterances actually being produced.
+This is the honest measurement.
 
 ---
 
@@ -392,7 +403,9 @@ Decoder/
 │
 ├── pipecat_integration/
 │   ├── tts_service.py                   ← MegakernelTTSService (pipecat TTSService subclass)
-│   └── demo.py                          ← STT (Deepgram) → LLM (Claude) → TTS → audio out
+│   ├── demo.py                          ← canonical Pipecat-library integration (reference)
+│   └── voice_loop.py                    ← LIVE voice-agent orchestrator (FastAPI WS @ 8766)
+│                                          STT → LLM → delegates TTS to server/app.py @ 8765
 │
 ├── refs/                                ← reference voice for cloning (gitignored)
 │   └── voice.wav                        ← provide your own, or bootstrap.sh fetches LJSpeech
@@ -404,7 +417,9 @@ Decoder/
 │   ├── inspect_model.py                 ← CPU/CUDA static API check (11 assertions)
 │   ├── test_cpu_integration.py          ← CPU-only HF-side end-to-end test (no GPU needed)
 │   ├── smoke_test.py                    ← 9-stage on-GPU validation (incl. kernel↔HF parity)
-│   └── demo_client.py                   ← laptop-side demo driver (mic-out + playback + metrics)
+│   ├── demo_client.py                   ← laptop-side TTS-only demo driver (3 prompts, playback)
+│   ├── voice_loop_client.py             ← laptop-side LIVE walkie-talkie client (mic + speakers)
+│   └── mock_tts_server.py               ← drop-in TTS mock for local laptop dev without GPU
 │
 └── benchmarks/
     ├── bench_ttfc.py
