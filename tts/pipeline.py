@@ -43,7 +43,7 @@ from typing import AsyncGenerator, Optional
 
 import torch
 
-from .codec import CodecDecoder, MIN_CHUNK_FRAMES, SAMPLE_RATE
+from .codec import CodecDecoder, MIN_CHUNK_FRAMES, DEFAULT_CHUNK_FRAMES, DEFAULT_OVERLAP_FRAMES, SAMPLE_RATE
 from .code_predictor import CodePredictor, CUDAGraphedCodePredictor
 
 
@@ -92,7 +92,8 @@ class TTSPipeline:
         self,
         talker_model_id: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         backend: str = "megakernel",
-        chunk_frames: int = MIN_CHUNK_FRAMES,
+        chunk_frames: int = DEFAULT_CHUNK_FRAMES,
+        overlap_frames: int = DEFAULT_OVERLAP_FRAMES,
         ref_audio_path: Optional[str] = None,
         ref_text: Optional[str] = None,
         language: str = "Auto",
@@ -100,6 +101,13 @@ class TTSPipeline:
     ):
         """
         Args:
+            chunk_frames: codec emits PCM after every N synthesised frames.
+                Sets the TTFC floor (= chunk_frames / 12.5 s). Default 4
+                (320 ms floor). Lower → less first-chunk latency but more
+                codec calls per second of audio.
+            overlap_frames: causal-context frames re-decoded with each new
+                chunk. Default 4. Raise when chunk_frames is small (1-2) to
+                keep audio quality steady.
             use_cuda_graph: when True (default) and backend == 'megakernel',
                 use the CUDAGraphedCodePredictor — captures the subtalker's
                 15-step decode into a single CUDA graph, ~8x faster per
@@ -114,6 +122,7 @@ class TTSPipeline:
 
         self.backend = backend
         self.chunk_frames = chunk_frames
+        self.overlap_frames = overlap_frames
         self._ref_audio_path = ref_audio_path
         self._ref_text = ref_text
         self._language = language
@@ -146,7 +155,7 @@ class TTSPipeline:
         else:
             print("Wrapping code predictor (HF reference) + codec...")
             self._predictor = CodePredictor(self._model)
-        self._codec = CodecDecoder(self._model)
+        self._codec = CodecDecoder(self._model, chunk_frames=chunk_frames, overlap_frames=overlap_frames)
 
         # Pre-build voice clone prompt once (if provided).  The wrapper handles
         # both ICL (ref_text given) and x-vector-only (ref_text=None) modes.

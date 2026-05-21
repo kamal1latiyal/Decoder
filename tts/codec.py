@@ -27,21 +27,61 @@ from typing import Optional
 SAMPLE_RATE = 24_000
 FRAME_RATE = 12.5
 SAMPLES_PER_FRAME = int(SAMPLE_RATE / FRAME_RATE)   # 1920
-MIN_CHUNK_FRAMES = 4                                # codec's minimum decode window
-MIN_CHUNK_SAMPLES = MIN_CHUNK_FRAMES * SAMPLES_PER_FRAME  # 7680
-OVERLAP_FRAMES = 4                                  # frames carried across calls
+
+# DEFAULT chunk and overlap. These are now both runtime-configurable per
+# CodecDecoder instance — see scripts/test_codec_streaming.py for the trade-off
+# analysis on small-K configurations.
+#
+# - chunk_frames: how many NEW frames the talker has to produce before the
+#   codec emits its first PCM chunk. Sets the TTFC floor (= chunk_frames / 12.5).
+#   Smaller is better for latency but means more codec calls per second of audio.
+# - overlap_frames: carried-over frames from the prior call, decoded again as
+#   causal context for the codec's transposed-convolution stack. Larger overlap
+#   keeps quality steady when chunk_frames is small.
+DEFAULT_CHUNK_FRAMES = 4
+DEFAULT_OVERLAP_FRAMES = 4
+
+# Hard lower bound: 1 frame is the smallest input the codec accepts (verified
+# in test_codec_min_chunk.py). Anything below this is an error.
+MIN_CHUNK_FRAMES = 1
+
+# Legacy alias still used by pipeline.py / scripts; equals current default.
+MIN_CHUNK_SAMPLES = DEFAULT_CHUNK_FRAMES * SAMPLES_PER_FRAME  # 7680
+OVERLAP_FRAMES = DEFAULT_OVERLAP_FRAMES
 
 
 class CodecDecoder:
     """Streaming wrapper over qwen3_tts.speech_tokenizer."""
 
-    # Codec input is bounded: history (≤ OVERLAP_FRAMES) + new frames per call.
-    # In practice the pipeline calls with `chunk_frames` new frames each time,
-    # so the worst-case input length is OVERLAP_FRAMES + chunk_frames. We
-    # pre-allocate slightly more to be safe (avoid re-allocations).
-    _MAX_INPUT_FRAMES = 32   # 4 overlap + up to 28 new frames per call
+    # Worst-case input length = chunk_frames + overlap_frames. We size the
+    # pre-allocated buffer for an aggressive [chunk=8, overlap=24] worst case.
+    _MAX_INPUT_FRAMES = 32
 
-    def __init__(self, qwen3_tts_model: torch.nn.Module):
+    def __init__(
+        self,
+        qwen3_tts_model: torch.nn.Module,
+        chunk_frames: int = DEFAULT_CHUNK_FRAMES,
+        overlap_frames: int = DEFAULT_OVERLAP_FRAMES,
+    ):
+        """
+        Args:
+            chunk_frames: how many NEW frames per decode call (TTFC floor =
+                chunk_frames / 12.5 sec). Default 4 (320 ms floor).
+            overlap_frames: previously-emitted frames replayed as causal
+                context. Default 4. Set higher if you reduce chunk_frames
+                aggressively to maintain audio quality.
+        """
+        if chunk_frames < MIN_CHUNK_FRAMES:
+            raise ValueError(f"chunk_frames must be >= {MIN_CHUNK_FRAMES}, got {chunk_frames}")
+        if overlap_frames < 0:
+            raise ValueError(f"overlap_frames must be >= 0, got {overlap_frames}")
+        if chunk_frames + overlap_frames > self._MAX_INPUT_FRAMES:
+            raise ValueError(
+                f"chunk_frames ({chunk_frames}) + overlap_frames ({overlap_frames}) "
+                f"= {chunk_frames + overlap_frames} > _MAX_INPUT_FRAMES "
+                f"({self._MAX_INPUT_FRAMES}); raise the buffer cap if needed"
+            )
+
         self.device = next(qwen3_tts_model.parameters()).device
         self._tokenizer = getattr(qwen3_tts_model, "speech_tokenizer", None)
         if self._tokenizer is None:
@@ -49,11 +89,12 @@ class CodecDecoder:
                 "Loaded model has no `speech_tokenizer` attribute. "
                 "Did you load Qwen3TTSForConditionalGeneration?"
             )
-        self._history_frames: list[list[int]] = []   # last OVERLAP_FRAMES we already emitted
+        self._chunk_frames = chunk_frames
+        self._overlap_frames = overlap_frames
+        self._history_frames: list[list[int]] = []   # last overlap_frames we already emitted
 
         # Pre-allocate the codec input tensor — avoids per-call torch.tensor()
         # which is ~0.5-2 ms on GPU due to host→device copy + alloc overhead.
-        # Sized for the worst case; we slice to the actual length per call.
         self._codes_buf = torch.zeros(
             self._MAX_INPUT_FRAMES, 16, dtype=torch.long, device=self.device,
         )
@@ -67,7 +108,13 @@ class CodecDecoder:
 
     @property
     def min_chunk_frames(self) -> int:
-        return MIN_CHUNK_FRAMES
+        """How many new frames the caller must hand us per decode call.
+        Returns the instance's configured chunk_frames (not the hard floor)."""
+        return self._chunk_frames
+
+    @property
+    def overlap_frames(self) -> int:
+        return self._overlap_frames
 
     @torch.inference_mode()
     def decode(self, frames: list[list[int]]) -> bytes:
@@ -86,9 +133,9 @@ class CodecDecoder:
         were emitted. Audio truncated silently after one chunk.
         Fix: slice the trailing `len(frames) * SAMPLES_PER_FRAME` samples.
         """
-        if len(frames) < MIN_CHUNK_FRAMES:
+        if len(frames) < self._chunk_frames:
             raise ValueError(
-                f"Need at least {MIN_CHUNK_FRAMES} frames per decode; got {len(frames)}"
+                f"Need at least {self._chunk_frames} frames per decode; got {len(frames)}"
             )
 
         all_frames = self._history_frames + frames
@@ -122,8 +169,8 @@ class CodecDecoder:
         new_samples = min(new_frame_count * SAMPLES_PER_FRAME, wav.shape[0])
         new_wav = wav[-new_samples:]
 
-        # Rotate history: keep last OVERLAP_FRAMES for next call's causal context.
-        keep = OVERLAP_FRAMES if len(all_frames) > OVERLAP_FRAMES else len(all_frames)
+        # Rotate history: keep last overlap_frames for next call's causal context.
+        keep = min(self._overlap_frames, len(all_frames))
         self._history_frames = list(all_frames[-keep:])
 
         clipped = np.clip(new_wav, -1.0, 1.0)

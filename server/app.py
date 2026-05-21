@@ -40,6 +40,10 @@ _REF_TEXT = os.environ.get("TTS_REF_TEXT") or None
 # CUDA-graphed subtalker is enabled by default for the megakernel backend.
 # Disable via env var or `--no-cuda-graph` to A/B against the HF reference.
 _USE_CUDA_GRAPH = os.environ.get("TTS_USE_CUDA_GRAPH", "1") not in ("0", "false", "False")
+# Codec chunking knobs — lower chunk_frames cuts TTFC, raise overlap_frames
+# to maintain quality. Defaults match the pre-existing 4/4 behaviour.
+_CHUNK_FRAMES = int(os.environ.get("TTS_CHUNK_FRAMES", "4"))
+_OVERLAP_FRAMES = int(os.environ.get("TTS_OVERLAP_FRAMES", "4"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -66,6 +70,8 @@ async def load_pipeline():
             ref_audio_path=_REF_AUDIO,
             ref_text=_REF_TEXT,
             use_cuda_graph=_USE_CUDA_GRAPH,
+            chunk_frames=_CHUNK_FRAMES,
+            overlap_frames=_OVERLAP_FRAMES,
         )
 
     _pipeline = await loop.run_in_executor(None, _build)
@@ -191,6 +197,12 @@ def main():
                         help="Transcript of the reference audio (required for ICL mode).")
     parser.add_argument("--no-cuda-graph", action="store_true",
                         help="Disable the CUDA-graphed subtalker (A/B against HF reference).")
+    parser.add_argument("--chunk-frames", type=int, default=_CHUNK_FRAMES,
+                        help=("How many new codec frames per decode call. Default 4. "
+                              "Lower = lower TTFC, but more codec calls per second of audio. "
+                              "Try 1-2 with --overlap-frames 6-8 for aggressive low-latency."))
+    parser.add_argument("--overlap-frames", type=int, default=_OVERLAP_FRAMES,
+                        help="Causal-context frames per codec call. Default 4. Raise when --chunk-frames is small.")
     args = parser.parse_args()
 
     # Propagate to the startup event via env (uvicorn re-imports the module).
@@ -201,6 +213,8 @@ def main():
         os.environ["TTS_REF_TEXT"] = args.ref_text
     if args.no_cuda_graph:
         os.environ["TTS_USE_CUDA_GRAPH"] = "0"
+    os.environ["TTS_CHUNK_FRAMES"] = str(args.chunk_frames)
+    os.environ["TTS_OVERLAP_FRAMES"] = str(args.overlap_frames)
 
     uvicorn.run(
         "server.app:app",
