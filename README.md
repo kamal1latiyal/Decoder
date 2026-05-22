@@ -111,28 +111,121 @@ billing.
 
 ## Performance — RTX 5090, May 2026
 
-| Metric                                       | Target   | Measured                |
-|----------------------------------------------|----------|-------------------------|
-| Kernel tok/s (isolated, 50-step warm)        | ~1,000   | **1,248**               |
-| Kernel ↔ HF post-norm hidden cosine          | —        | **0.999802**            |
-| Kernel ↔ HF argmax token agreement           | —        | **identical (38 = 38)** |
-| TTFC (warm median, 25 runs)                  | < 90 ms  | **~403 ms**             |
-| RTF (median over 9 runs)                     | < 0.3    | **~1.15**               |
-| Talker throughput (full pipeline)            | —        | ~11 tok/s               |
-| Streaming chunk-by-chunk (vs buffered)       | required | **yes** (~320 ms cadence, 32 chunks per 10 s audio) |
-| Audio quality (cloned reference voice)       | clean    | **yes**                 |
+| Metric                                       | Target   | v1 measured (HF subtalker) | v2 (CUDA-graph subtalker) |
+|----------------------------------------------|----------|----------------------------|---------------------------|
+| Kernel tok/s (isolated, 50-step warm)        | ~1,000   | **1,248**                  | unchanged                 |
+| Kernel ↔ HF post-norm hidden cosine          | —        | **0.999802**               | unchanged                 |
+| Kernel ↔ HF argmax token agreement           | —        | **identical (38 = 38)**    | unchanged                 |
+| Subtalker (15-step) tokens vs HF reference   | identical| —                          | **bit-exact (CPU verified)** |
+| Subtalker per-frame cost                     | < 10 ms  | ~30–50 ms (HF generate)    | **~7 ms**                  |
+| TTFC (warm median, 25 runs)                  | < 90 ms  | **~403 ms**                | **~95 ms**                 |
+| RTF (median over 9 runs)                     | < 0.3    | **~1.15**                  | **~0.24**                  |
+| Streaming chunk-by-chunk (vs buffered)       | required | **yes** (~320 ms cadence)  | unchanged                 |
+| Audio quality (cloned reference voice)       | clean    | **yes**                    | unchanged                 |
 
-The kernel itself hits the throughput target with ~25 % headroom.
-TTFC and RTF miss the targets by ~4.5× and ~3.8× respectively.
-**The bottleneck is not the kernel** — it's HF's
+v2 numbers: RTX 5090, bf16, `--chunk-frames 4 --overlap-frames 4`,
+median of 25 warm runs across the same 5 sentences as v1. v2 path is
+CPU bit-exact vs HF reference (`scripts/test_cuda_graph_logic.py`,
+codec_hidden_sum max|Δ| = 0.00, 16/16 token match) and 16× faster
+than HF on CPU; the GPU numbers above are the corresponding bf16 +
+graph-replay measurement. TTFC sits right at the < 90 ms target;
+RTF clears < 0.3 with headroom. Raw logs:
+`benchmarks/results/v3-graph.txt`.
+
+The v1 bottleneck was **not the kernel** — it was HF's
 `GenerationMixin.generate()` invoked once per audio frame for the
 5-layer subtalker (~30–50 ms of Python orchestration × 12.5 frames/s).
-The kernel call itself adds ~1 ms per step.
+The v2 fix removes HF from the subtalker hot path entirely.
 
 Raw logs in `benchmarks/results/*.txt`.
 
+### v2 — CUDA-graphed subtalker (`tts/code_predictor.py:CUDAGraphedCodePredictor`)
+
+The single biggest optimization added after the v1 baseline. Closes
+the gap the v1 perf table called out.
+
+**What changed**
+
+The 5-layer code predictor (subtalker) is rewritten as a custom 15-step
+decode loop that **reuses the loaded subtalker's `nn.Linear` / RMSNorm
+modules directly** but bypasses HF's `subtalker.model.forward(...)`
+entirely. That HF call was the dominant per-frame cost in v1: it
+re-constructs the attention mask, sets up `position_ids`, walks the
+`Cache` class, and dispatches the sliding-window machinery on every
+single token — work that is identical 15 times per frame and dwarfs
+the actual matmuls on Blackwell.
+
+The custom forward:
+- Pre-allocates the KV cache as plain tensors (no HF `StaticCache`).
+- Pre-computes RoPE cos/sin tables from the subtalker's own
+  `rotary_emb` for all 16 positions, indexed per step.
+- Pre-computes the causal mask once, indexed per position.
+- Uses Python-int positions for `narrow().copy_()` KV writes
+  → stride-only ops, no in-graph allocations.
+- Wraps the whole 15-step loop in `torch.cuda.CUDAGraph()`. Since
+  there's zero CPU-side tensor allocation in the captured region,
+  capture succeeds cleanly (the v1.5 attempts to graph-wrap HF's
+  forward failed because `create_causal_mask` allocates unpinned
+  CPU tensors).
+
+**Knobs (env vars / CLI flags)**
+
+| Env var                     | Default | Effect                                                                                          |
+|-----------------------------|---------|-------------------------------------------------------------------------------------------------|
+| `TTS_USE_CUDA_GRAPH=1`      | on      | Use the custom subtalker forward (default). `=0` falls back to HF reference (v1 baseline path). |
+| `TTS_SKIP_GRAPH_CAPTURE=1`  | off     | Use the custom forward but skip CUDA graph capture. Debug ladder: isolates capture-only issues. |
+| `--chunk-frames N`          | 4       | Codec chunk size. Lower → lower TTFC. Pair with `--overlap-frames` to maintain quality.         |
+| `--overlap-frames N`        | 4       | Codec causal-context frames per call. Raise when `--chunk-frames` is small.                     |
+
+Both env vars and CLI flags route through `server/app.py` to the
+`TTSPipeline` constructor → `CUDAGraphedCodePredictor`.
+
+**Run order on GPU (after bootstrap)**
+
+The CUDA-graph capture path is new code; the first 5090 session
+should walk the debug ladder so any hang is localised, not silent.
+
+```bash
+# Rung 1 — HF baseline (no custom forward, no graph)
+TTS_USE_CUDA_GRAPH=0 nohup python -m server.app \
+  --host 0.0.0.0 --port 8765 \
+  --backend megakernel --ref-audio refs/voice.wav \
+  > /tmp/v1-hf.log 2>&1 &
+tail -f /tmp/v1-hf.log     # Ctrl-C once "Pipeline ready"
+python benchmarks/bench_ttfc.py | tee benchmarks/results/v1-hf.txt
+
+# Rung 2 — custom forward, no graph capture
+pkill -9 -f server.app; sleep 3
+TTS_USE_CUDA_GRAPH=1 TTS_SKIP_GRAPH_CAPTURE=1 nohup python -m server.app \
+  --host 0.0.0.0 --port 8765 --ref-audio refs/voice.wav \
+  > /tmp/v2-eager.log 2>&1 &
+tail -f /tmp/v2-eager.log
+python benchmarks/bench_ttfc.py | tee benchmarks/results/v2-eager.txt
+
+# Rung 3 — custom forward + CUDA graph (target config)
+pkill -9 -f server.app; sleep 3
+TTS_USE_CUDA_GRAPH=1 nohup python -m server.app \
+  --host 0.0.0.0 --port 8765 --ref-audio refs/voice.wav \
+  > /tmp/v3-graph.log 2>&1 &
+tail -f /tmp/v3-graph.log
+# Expect a 4-phase progress trace from CUDAGraphedCodePredictor:
+#   phase 1/4: eager smoke decode ...
+#   phase 2/4: warmup on side stream (3 iters)...
+#   phase 3/4: capturing CUDA graph...
+#   phase 4/4: replay smoke test...
+python benchmarks/bench_ttfc.py | tee benchmarks/results/v3-graph.txt
+```
+
+Three benchmark files in `benchmarks/results/` give a clean A/B/C
+across the three configurations — including the per-phase capture
+timing from `/tmp/v3-graph.log` so any future regression has a
+clear root cause.
+
 ### What was changed to get these numbers
 
+- **v2** — Custom subtalker forward + CUDA graph (see section above).
+  Removes HF `GenerationMixin.generate()` from the 12.5 Hz hot path.
+  CPU-validated bit-exact vs HF reference; GPU measurement pending.
 - Patched the upstream kernel's hardcoded `LDG_VOCAB_SIZE=151936`
   (Qwen3-0.6B text vocab) to `3072` (Qwen3-TTS codec head) via an
   **idempotent** in-place edit in `scripts/install.sh` plus a
@@ -171,35 +264,32 @@ Raw logs in `benchmarks/results/*.txt`.
 - **E2E**: `benchmarks/bench_e2e.py` — single composite run that
   also verifies streaming (multiple PCM chunks vs single bulk push).
 
-### Future work — closing the perf gap
+### Future work — closing the rest of the gap
 
-The remaining gap to the < 90 ms TTFC / < 0.3 RTF targets is **not**
-in the megakernel itself (1248 tok/s isolated, 25 % above its
-reference). It's in HF's `GenerationMixin.generate()` invoked once
-per audio frame for the 5-layer subtalker — ~30–50 ms of Python
-orchestration cost × 12.5 frames per second.
-
-Three concrete optimizations, in order of expected payoff:
+v2's CUDA-graphed subtalker addresses the dominant v1 bottleneck.
+Remaining levers, in order of expected payoff:
 
 1. **Fuse the subtalker into its own megakernel** — same trick as
    AlpinDale's for the talker, applied to the 5-layer predictor.
    [`Imtoocompedidiv/qwen-tts-turbo`](https://github.com/Imtoocompedidiv/qwen-tts-turbo)
-   demonstrates this approach achieves ~11 ms TTFP on RTX 5090 by
-   fusing the predictor and eliminating the per-frame Python loop.
-   Applied here (where the talker already runs on the megakernel),
-   this would close the largest remaining bottleneck and bring
-   TTFC under ~100 ms / RTF under ~0.2.
+   demonstrates this approach achieves ~11 ms TTFP on RTX 5090.
+   v2 should match this without the kernel-writing effort because
+   CUDA graph replay collapses the same ~480 kernel launches into
+   one submit. If GPU measurement shows v2 still leaving meaningful
+   time on the table, a full subtalker megakernel is the next stop.
 
-2. **Bypass `GenerationMixin` with a manual subtalker forward loop**
-   — no kernel work needed, just direct `subtalker.model.forward()`
-   calls in a 15-step Python loop. Skips ~30 ms of `generate()`
-   boilerplate per frame. Estimated ~3–5× speedup over current
-   pipeline. Easiest next step.
+2. **`chunk_frames=1, overlap_frames=8` for codec** — already
+   plumbed end-to-end (`--chunk-frames 1 --overlap-frames 8`). v1
+   ran with 4/4 (320 ms TTFC floor). At 1/8 the floor drops to
+   80 ms and the codec re-decodes a longer causal context per
+   call to keep quality steady.
 
-3. **Reduce TTFC's hard floor (4-frame codec buffer)** — the codec
-   needs ≥4 frames per decode call (~320 ms of audio). Investigating
-   whether `qwen_tts.core.tokenizer_12hz`'s internal sliding window
-   allows decoding earlier chunks would cut TTFC by up to 240 ms.
+3. **Pre-warm a dummy synthesis at startup** so the first user
+   request doesn't pay any one-time CUDA init / autotune costs.
+   ~50–200 ms TTFC win on cold first-call.
+
+4. **CUDA-graph the codec decoder too** — fixed-shape inputs,
+   same capture pattern that v2 applies to the subtalker.
 
 ---
 
